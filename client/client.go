@@ -3,12 +3,36 @@ package client
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
-func Get(cid string, output string, nodeConfig *NodeConfig) error {
+type ExecConfig struct {
+	Timeout *time.Duration
+}
+
+func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if execConfig.Timeout == nil {
+		return get(ctx, cid, output, nodeConfig)
+	}
+
+	result := make(chan error, 1)
+
+	go func() {
+		result <- get(ctx, cid, output, nodeConfig)
+	}()
+
+	select {
+	case err := <- result:
+		return err
+	case <-time.After(*execConfig.Timeout):
+		return fmt.Errorf("timeout")
+	}
+}
+
+func get(ctx context.Context, cid string, output string, nodeConfig *NodeConfig) error {
 	node, err := StartNode(ctx, nodeConfig)
 	if err != nil {
 		return err
