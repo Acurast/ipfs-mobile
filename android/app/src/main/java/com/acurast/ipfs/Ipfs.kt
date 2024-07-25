@@ -42,12 +42,6 @@ public class Ipfs(private val bootstrapNodes: List<String> = emptyList(), privat
             if (!exists()) mkdirs()
         }
 
-    private val Context.ipfsPluginsDir: File
-        get() = ipfsDir(DIR_PLUGINS)
-
-    private val Context.ipfsRepoDir: File
-        get() = ipfsDir(DIR_REPO)
-
     private val Context.ipfsDataDir: File
         get() = ipfsDir(DIR_DATA)
 
@@ -55,8 +49,6 @@ public class Ipfs(private val bootstrapNodes: List<String> = emptyList(), privat
         private const val PORT = 0
 
         private const val DIR_IPFS = "ipfs"
-        private const val DIR_PLUGINS = "plugins"
-        private const val DIR_REPO = "repo"
         private const val DIR_DATA = "data"
 
         private const val DELIMITER_LIST_STRING = ";"
