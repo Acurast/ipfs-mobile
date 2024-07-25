@@ -3,41 +3,50 @@ package client
 import (
 	"context"
 	"fmt"
-	"io"
 	"sync"
 
-	"github.com/ipfs/boxo/files"
-	"github.com/ipfs/boxo/path"
 	"github.com/ipfs/go-cid"
-	"github.com/ipfs/kubo/config"
-	"github.com/ipfs/kubo/core"
-	"github.com/ipfs/kubo/core/coreapi"
-	"github.com/ipfs/kubo/core/coreiface"
-	"github.com/ipfs/kubo/core/node/libp2p"
-	"github.com/ipfs/kubo/plugin/loader"
-	"github.com/ipfs/kubo/repo"
-	"github.com/ipfs/kubo/repo/fsrepo"
+	"github.com/ipfs/go-datastore"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p-routing-helpers"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/multiformats/go-multiaddr"
+
+	bsclient "github.com/ipfs/boxo/bitswap/client"
+	bsnet "github.com/ipfs/boxo/bitswap/network"
+	"github.com/ipfs/boxo/blockservice"
+	"github.com/ipfs/boxo/blockstore"
+	"github.com/ipfs/boxo/files"
+	"github.com/ipfs/boxo/ipld/merkledag"
+	"github.com/ipfs/boxo/ipld/unixfs/file"
 )
 
 type Node interface {
-	iface.CoreAPI
+	Close()
 	ConnectToPeers(ctx context.Context, peers []string) error
 	Download(ctx context.Context, cidStr string, output string) error
 }
 
-type NodeDecorator struct {
-	iface.CoreAPI
+type NodeConcrete struct {
+	host host.Host
+	client *bsclient.Client
 }
 
 type NodeConfig struct {
 	BootstrapPeers []string
-	Plugins        string
-	Repo           string
+	Port		   int32
 }
 
-func (node NodeDecorator) ConnectToPeers(ctx context.Context, peers []string) error {
+func (node NodeConcrete) Close() {
+	node.host.Close()
+	node.client.Close()
+}
+
+func (node NodeConcrete) ConnectToPeers(ctx context.Context, peers []string) error {
 	var wg sync.WaitGroup
 	peerInfos := make(map[peer.ID]*peer.AddrInfo, len(peers))
 	for _, addrStr := range peers {
@@ -64,7 +73,7 @@ func (node NodeDecorator) ConnectToPeers(ctx context.Context, peers []string) er
 	for _, peerInfo := range peerInfos {
 		go func(peerInfo *peer.AddrInfo) {
 			defer wg.Done()
-			err := node.Swarm().Connect(ctx, *peerInfo)
+			err := node.host.Connect(ctx, *peerInfo)
 			if err != nil {
 				fmt.Printf("failed to connect to %s: %s", peerInfo.ID, err)
 			}
@@ -75,79 +84,53 @@ func (node NodeDecorator) ConnectToPeers(ctx context.Context, peers []string) er
 	return nil
 }
 
-func (node NodeDecorator) Download(ctx context.Context, cidStr string, output string) error {
-	path := path.FromCid(cid.MustParse(cidStr))
-	file, err := node.Unixfs().Get(ctx, path)
+func (node NodeConcrete) Download(ctx context.Context, cidStr string, output string) error {
+	bserv := blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), node.client)
+	session := merkledag.NewSession(ctx, merkledag.NewDAGService(bserv))
+	dserv := merkledag.NewReadOnlyDagService(session)
+
+	nd, err := dserv.Get(ctx, cid.MustParse(cidStr))
 	if err != nil {
 		return err
 	}
 
-	return files.WriteTo(file, output)
+	unixfsnd, err := unixfile.NewUnixfsFile(ctx, dserv, nd)
+	if err != nil {
+		return err
+	}
+
+	return files.WriteTo(unixfsnd, output)
 }
 
 func StartNode(ctx context.Context, config *NodeConfig) (Node, error) {
-	err := setupPlugins(config.Plugins)
+	host, err := makeHost(config.Port)
 	if err != nil {
 		return nil, err
 	}
 
-	repo, err := openRepo(config.Repo)
-	if err != nil {
-		return nil, err
-	}
+	client := startClient(ctx, host)
 
-	node, err := createNode(ctx, repo)
-	if err != nil {
-		return nil, err
-	}
-
-	api, err := coreapi.NewCoreAPI(node)
-	if err != nil {
-		return nil, err
-	}
-
-	return NodeDecorator{api}, nil
+	return NodeConcrete{host, client}, nil
 }
 
-func setupPlugins(path string) error {
-	plugins, err := loader.NewPluginLoader(path)
-	if err != nil {
-		return fmt.Errorf("failed to load plugins: %s", err)
-	}
-
-	err = plugins.Initialize()
-	if err != nil {
-		return fmt.Errorf("failed to initialize plugins: %s", err)
-	}
-
-	err = plugins.Inject()
-	if err != nil {
-		return fmt.Errorf("failed to inject plugins: %s", err)
-	}
-
-	return nil
-}
-
-func openRepo(path string) (repo.Repo, error) {
-	config, err := config.Init(io.Discard, 2048)
+func makeHost(port int32) (host.Host, error) {
+	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
 	if err != nil {
 		return nil, err
 	}
 
-	err = fsrepo.Init(path, config)
-	if err != nil {
-		return nil, err
+	opts := []libp2p.Option{
+		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port)),
+		libp2p.Identity(priv),
 	}
 
-	return fsrepo.Open(path)
+	return libp2p.New(opts...)
 }
 
-func createNode(ctx context.Context, repo repo.Repo) (*core.IpfsNode, error) {
-	config := &core.BuildCfg{
-		Online:  true,
-		Routing: libp2p.DHTClientOption,
-		Repo:    repo,
-	}
+func startClient(ctx context.Context, host host.Host) *bsclient.Client {
+	network := bsnet.NewFromIpfsHost(host, routinghelpers.Null{})
+	client := bsclient.New(ctx, network, blockstore.NewBlockstore(datastore.NewNullDatastore()))
+	network.Start(client)
 
-	return core.NewNode(ctx, config)
+	return client
 }

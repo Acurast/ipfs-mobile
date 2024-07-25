@@ -9,7 +9,7 @@ import java.io.File
 import java.io.IOException
 import kotlin.time.Duration
 
-public class Ipfs(private val bootstrapNodes: List<String> = emptyList()) {
+public class Ipfs(private val bootstrapNodes: List<String> = emptyList(), private val port: Int = PORT) {
 
     public suspend fun get(
         context: Context,
@@ -20,11 +20,10 @@ public class Ipfs(private val bootstrapNodes: List<String> = emptyList()) {
         try {
             val output = output ?: File(context.ipfsDataDir, cid)
 
-            Ffi.get(cid, output.absolutePath, Config().apply {
-                bootstrapPeers = bootstrapNodes.joinToString(DELIMITER_LIST_STRING)
-                plugins = context.ipfsPluginsDir.absolutePath
-                repo = context.ipfsRepoDir.absolutePath
-                timeoutMs = timeout?.inWholeMilliseconds ?: -1L
+            Ffi.get(cid, output.absolutePath, Config().also {
+                it.bootstrapPeers = bootstrapNodes.joinToString(DELIMITER_LIST_STRING)
+                it.port = port
+                it.timeout = timeout?.inWholeMilliseconds ?: -1L
             })
 
             output
@@ -53,10 +52,12 @@ public class Ipfs(private val bootstrapNodes: List<String> = emptyList()) {
         get() = ipfsDir(DIR_DATA)
 
     public companion object {
-        private const val DIR_IPFS: String = "ipfs"
-        private const val DIR_PLUGINS: String = "plugins"
-        private const val DIR_REPO: String = "repo"
-        private const val DIR_DATA: String = "data"
+        private const val PORT = 0
+
+        private const val DIR_IPFS = "ipfs"
+        private const val DIR_PLUGINS = "plugins"
+        private const val DIR_REPO = "repo"
+        private const val DIR_DATA = "data"
 
         private const val DELIMITER_LIST_STRING = ";"
     }

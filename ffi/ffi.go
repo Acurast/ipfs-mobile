@@ -9,21 +9,19 @@ import (
 
 type Config struct {
 	BootstrapPeers string
-	Plugins 	   string
-	Repo 		   string
-	TimeoutMs	   int64
+	Port 	   	   int32
+	Timeout 	   int64
 }
 
 func Get(cid string, output string, config *Config) error {
 	nodeConfig := &client.NodeConfig{
 		BootstrapPeers: utils.GetStringSlice(config.BootstrapPeers),
-		Plugins: 		config.Plugins,
-		Repo:    		config.Repo,
+		Port:			config.Port,
 	}
 
 	var optTimeout *time.Duration = nil
-	if (config.TimeoutMs >= 0) {
-		timeout := time.Duration(config.TimeoutMs) * time.Millisecond
+	if (config.Timeout >= 0) {
+		timeout := time.Duration(config.Timeout) * time.Millisecond
 		optTimeout = &timeout
 	}
 

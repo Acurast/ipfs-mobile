@@ -37,6 +37,7 @@ func get(ctx context.Context, cid string, output string, nodeConfig *NodeConfig)
 	if err != nil {
 		return err
 	}
+	defer node.Close()
 
 	go func() {
 		err := node.ConnectToPeers(ctx, nodeConfig.BootstrapPeers)
