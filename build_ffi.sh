@@ -47,6 +47,8 @@ function init () {
 
 function bind () {
     echo "Binding with gomobile..."
+
+    go get golang.org/x/mobile
     
     ANDROID_API=$(grep "minSdk" $CURR_DIR/android/app/build.gradle.kts | awk '{print $3}' | tr -d \''"\')
     echo "  [android]"
@@ -56,6 +58,8 @@ function bind () {
     else
         echo -e "\r    \xE2\x9C\x97 API $ANDROID_API"
     fi
+
+    go mod tidy
 }
 
 check_tools
