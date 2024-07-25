@@ -2,14 +2,17 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p-routing-helpers"
+	routinghelpers "github.com/libp2p/go-libp2p-routing-helpers"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -22,28 +25,24 @@ import (
 	"github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/files"
 	"github.com/ipfs/boxo/ipld/merkledag"
-	"github.com/ipfs/boxo/ipld/unixfs/file"
+	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 )
 
 type Node interface {
-	Close()
 	ConnectToPeers(ctx context.Context, peers []string) error
 	Download(ctx context.Context, cidStr string, output string) error
+	Close()
 }
 
 type NodeConcrete struct {
-	host host.Host
+	id	   string
+	host   host.Host
 	client *bsclient.Client
 }
 
 type NodeConfig struct {
 	BootstrapPeers []string
-	Port		   int32
-}
-
-func (node NodeConcrete) Close() {
-	node.host.Close()
-	node.client.Close()
+	Port           int32
 }
 
 func (node NodeConcrete) ConnectToPeers(ctx context.Context, peers []string) error {
@@ -102,15 +101,60 @@ func (node NodeConcrete) Download(ctx context.Context, cidStr string, output str
 	return files.WriteTo(unixfsnd, output)
 }
 
-func StartNode(ctx context.Context, config *NodeConfig) (Node, error) {
-	host, err := makeHost(config.Port)
+func (node NodeConcrete) Close() {
+	nodeMutex.Lock()
+	defer nodeMutex.Unlock()
+
+	node.host.Close()
+	node.client.Close()
+
+	delete(nodes, node.id)
+}
+
+var (
+	nodes     = make(map[string]Node)
+	nodeMutex sync.Mutex
+)
+
+func GetNode(ctx context.Context, config *NodeConfig) (Node, error) {
+	id := getNodeId(config)
+
+	nodeMutex.Lock()
+	defer nodeMutex.Unlock()
+
+	if node, exists := nodes[id]; exists {
+		return node, nil
+	}
+
+	host, client, err := startNode(ctx, config)
 	if err != nil {
 		return nil, err
 	}
 
+	node := NodeConcrete{id, host, client}
+
+	nodes[id] = node
+	return node, nil
+}
+
+func getNodeId(config *NodeConfig) string {
+	sort.Strings(config.BootstrapPeers)
+
+	hash := sha256.New()
+	hash.Write([]byte(fmt.Sprintf("%v", config)))
+
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func startNode(ctx context.Context, config *NodeConfig) (host.Host, *bsclient.Client, error) {
+	host, err := makeHost(config.Port)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	client := startClient(ctx, host)
 
-	return NodeConcrete{host, client}, nil
+	return host, client, nil
 }
 
 func makeHost(port int32) (host.Host, error) {

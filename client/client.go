@@ -25,7 +25,7 @@ func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConf
 	}()
 
 	select {
-	case err := <- result:
+	case err := <-result:
 		return err
 	case <-time.After(*execConfig.Timeout):
 		return fmt.Errorf("timeout")
@@ -33,7 +33,7 @@ func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConf
 }
 
 func get(ctx context.Context, cid string, output string, nodeConfig *NodeConfig) error {
-	node, err := StartNode(ctx, nodeConfig)
+	node, err := GetNode(ctx, nodeConfig)
 	if err != nil {
 		return err
 	}
