@@ -1,23 +1,15 @@
-import org.jetbrains.kotlin.cli.jvm.main
-
 plugins {
     alias(libs.plugins.android.library)
     alias(libs.plugins.jetbrains.kotlin.android)
-}
-
-object Library {
-    const val groupId = "com.acurast.ipfs"
-    const val artifactId = "client"
-    const val version = "1.0.0"
+    id("maven-publish")
 }
 
 android {
-    namespace = Library.groupId
+    namespace = group as String?
     compileSdk = 34
 
     defaultConfig {
         minSdk = 24
-        version = Library.version
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -35,18 +27,28 @@ android {
         sourceCompatibility = JavaVersion.VERSION_1_8
         targetCompatibility = JavaVersion.VERSION_1_8
     }
+    kotlin {
+        explicitApiWarning()
+    }
     kotlinOptions {
         jvmTarget = "1.8"
     }
-    sourceSets {
-        getByName("main") {
-            jniLibs.srcDirs("libs")
+}
+
+publishing {
+    publications {
+        register<MavenPublication>("maven") {
+            artifactId = "client"
+
+            afterEvaluate {
+                from(components["release"])
+            }
         }
     }
 }
 
 dependencies {
-    implementation(fileTree("libs") { include("*.aar") })
+    implementation(project(":ffi"))
 
     implementation(libs.androidx.core.ktx)
     testImplementation(libs.junit)

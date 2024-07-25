@@ -21,4 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "IPFS"
 include(":app")
- 
+include(":ffi")

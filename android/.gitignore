@@ -1,6 +1,6 @@
 .DS_Store
-app/libs/ipfs.aar
-app/libs/*.jar
+ffi/*.aar
+ffi/*.jar
 
 ### Android template
 # Gradle files

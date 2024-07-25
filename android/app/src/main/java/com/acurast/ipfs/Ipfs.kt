@@ -9,9 +9,9 @@ import java.io.File
 import java.io.IOException
 import kotlin.time.Duration
 
-class Ipfs(private val bootstrapNodes: List<String> = emptyList()) {
+public class Ipfs(private val bootstrapNodes: List<String> = emptyList()) {
 
-    suspend fun get(
+    public suspend fun get(
         context: Context,
         cid: String,
         output: File? = null,
@@ -52,7 +52,7 @@ class Ipfs(private val bootstrapNodes: List<String> = emptyList()) {
     private val Context.ipfsDataDir: File
         get() = ipfsDir(DIR_DATA)
 
-    companion object {
+    public companion object {
         private const val DIR_IPFS: String = "ipfs"
         private const val DIR_PLUGINS: String = "plugins"
         private const val DIR_REPO: String = "repo"

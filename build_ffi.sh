@@ -48,10 +48,10 @@ function init () {
 function bind () {
     echo "Binding with gomobile..."
     
-    ANDROID_API=$(grep "compileSdk" $CURR_DIR/android/app/build.gradle.kts | awk '{print $3}' | tr -d \''"\')
+    ANDROID_API=$(grep "minSdk" $CURR_DIR/android/app/build.gradle.kts | awk '{print $3}' | tr -d \''"\')
     echo "  [android]"
     echo -en "    / API $ANDROID_API"
-    if gomobile bind -o $CURR_DIR/android/app/libs/ipfs.aar -target=android -androidapi $ANDROID_API ./ffi; then
+    if gomobile bind -o $CURR_DIR/android/ffi/ipfs.aar -target=android -androidapi $ANDROID_API ./ffi; then
         echo -e "\r    \xE2\x9C\x94 API $ANDROID_API"
     else
         echo -e "\r    \xE2\x9C\x97 API $ANDROID_API"
