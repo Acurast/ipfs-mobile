@@ -53,7 +53,7 @@ function bind () {
     ANDROID_API=$(grep "minSdk" $CURR_DIR/android/app/build.gradle.kts | awk '{print $3}' | tr -d \''"\')
     echo "  [android]"
     echo -en "    / API $ANDROID_API"
-    if gomobile bind -o $CURR_DIR/android/ffi/ipfs.aar -target=android -androidapi $ANDROID_API ./ffi; then
+    if gomobile bind -o $CURR_DIR/android/ffi/ipfs.aar -target=android/arm,android/arm64 -androidapi $ANDROID_API ./ffi; then
         echo -e "\r    \xE2\x9C\x94 API $ANDROID_API"
     else
         echo -e "\r    \xE2\x9C\x97 API $ANDROID_API"
