@@ -11,15 +11,11 @@ import kotlin.time.Duration
 
 public class Ipfs(private val bootstrapNodes: List<String> = emptyList(), private val port: Int = PORT) {
 
-    public suspend fun get(
-        context: Context,
-        cid: String,
-        output: File? = null,
-        timeout: Duration? = null,
-    ): File = withContext(Dispatchers.IO) {
-        try {
-            val output = output ?: File(context.ipfsDataDir, cid)
+    public suspend fun get(cid: String, context: Context, timeout: Duration? = null): File =
+        get(cid, File(context.ipfsDataDir, cid), timeout)
 
+    public suspend fun get(cid: String, output: File, timeout: Duration? = null): File = withContext(Dispatchers.IO) {
+        try {
             Ffi.get(cid, output.absolutePath, Config().also {
                 it.bootstrapPeers = bootstrapNodes.joinToString(DELIMITER_LIST_STRING)
                 it.port = port
