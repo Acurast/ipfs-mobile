@@ -4,5 +4,7 @@ before_install:
   - rm -rf /usr/local/go && tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
   - export PATH=$PATH:/usr/local/go/bin
   - go install golang.org/x/mobile/cmd/gomobile@latest
+  - export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$(ls $ANDROID_HOME/ndk | sort -V | tail -n 1)
   - chmod 755 build_ffi.sh
   - ./build_ffi.sh
+  - cd ./android
