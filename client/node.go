@@ -195,7 +195,7 @@ func connectToPeers(ctx context.Context, host host.Host, peers []string) error {
 			defer wg.Done()
 			err := host.Connect(ctx, *peerInfo)
 			if err != nil {
-				fmt.Printf("failed to connect to %s: %s", peerInfo.ID, err)
+				fmt.Printf("failed to connect to %s: %s\n", peerInfo.ID, err)
 			}
 		}(peerInfo)
 	}
