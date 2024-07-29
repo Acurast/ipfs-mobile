@@ -2,24 +2,42 @@ package client
 
 import (
 	"context"
-	"fmt"
+	"time"
+
+	"ipfs-mobile/utils"
 )
 
-func Get(cid string, output string, nodeConfig *NodeConfig) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+type ExecConfig struct {
+	Timeout *time.Duration
+}
 
-	node, err := StartNode(ctx, nodeConfig)
+func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConfig) error {
+	node, err := GetNode(nodeConfig)
 	if err != nil {
 		return err
 	}
+	defer node.Close()
+
+	if execConfig.Timeout == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		return node.Download(ctx, cid, output)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), *execConfig.Timeout)
+	defer cancel()
+
+	result := make(chan error, 1)
 
 	go func() {
-		err := node.ConnectToPeers(ctx, nodeConfig.BootstrapPeers)
-		if err != nil {
-			fmt.Printf("failed to connect to peers: %s\n", err)
-		}
+		result <- node.Download(ctx, cid, output)
 	}()
 
-	return node.Download(ctx, cid, output)
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return utils.Timeout()
+	}
 }
