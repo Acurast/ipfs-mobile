@@ -10,13 +10,13 @@ function check_tools () {
         echo -e "    \xE2\x9C\x94 go"
     else
         echo -e "    \xE2\x9C\x97 go"
-        ERROR="go could not been found"
+        ERROR="go has not been found"
     fi
     if which gomobile >/dev/null; then
         echo -e "    \xE2\x9C\x94 gomobile"
     else
         echo -e "    \xE2\x9C\x97 gomobile"
-        ERROR="gomobile could not been found"
+        ERROR="gomobile has not been found"
     fi
 
     echo "  [variables]"
