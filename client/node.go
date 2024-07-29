@@ -29,58 +29,23 @@ import (
 )
 
 type Node interface {
-	ConnectToPeers(ctx context.Context, peers []string) error
 	Download(ctx context.Context, cidStr string, output string) error
+	Connect()
 	Close()
 }
 
 type NodeConcrete struct {
-	id	   string
-	host   host.Host
-	client *bsclient.Client
+	id 		  string
+	cancel 	  context.CancelFunc
+	connected int
+
+	host 	  host.Host
+	client 	  *bsclient.Client
 }
 
 type NodeConfig struct {
 	BootstrapPeers []string
 	Port           int32
-}
-
-func (node NodeConcrete) ConnectToPeers(ctx context.Context, peers []string) error {
-	var wg sync.WaitGroup
-	peerInfos := make(map[peer.ID]*peer.AddrInfo, len(peers))
-	for _, addrStr := range peers {
-		addr, err := multiaddr.NewMultiaddr(addrStr)
-		if err != nil {
-			return err
-		}
-
-		pii, err := peer.AddrInfoFromP2pAddr(addr)
-		if err != nil {
-			return err
-		}
-
-		pi, ok := peerInfos[pii.ID]
-		if !ok {
-			pi = &peer.AddrInfo{ID: pii.ID}
-			peerInfos[pi.ID] = pi
-		}
-
-		pi.Addrs = append(pi.Addrs, pii.Addrs...)
-	}
-
-	wg.Add(len(peerInfos))
-	for _, peerInfo := range peerInfos {
-		go func(peerInfo *peer.AddrInfo) {
-			defer wg.Done()
-			err := node.host.Connect(ctx, *peerInfo)
-			if err != nil {
-				fmt.Printf("failed to connect to %s: %s", peerInfo.ID, err)
-			}
-		}(peerInfo)
-	}
-	wg.Wait()
-
-	return nil
 }
 
 func (node NodeConcrete) Download(ctx context.Context, cidStr string, output string) error {
@@ -101,14 +66,25 @@ func (node NodeConcrete) Download(ctx context.Context, cidStr string, output str
 	return files.WriteTo(unixfsnd, output)
 }
 
-func (node NodeConcrete) Close() {
+func (node *NodeConcrete) Connect() {
+	node.connected++
+}
+
+func (node *NodeConcrete) Close() {
 	nodeMutex.Lock()
 	defer nodeMutex.Unlock()
+
+	node.connected--
+	if node.connected > 0 {
+		return
+	}
 
 	node.host.Close()
 	node.client.Close()
 
 	delete(nodes, node.id)
+
+	node.cancel()
 }
 
 var (
@@ -116,22 +92,33 @@ var (
 	nodeMutex sync.Mutex
 )
 
-func GetNode(ctx context.Context, config *NodeConfig) (Node, error) {
+func GetNode(config *NodeConfig) (Node, error) {
 	id := getNodeId(config)
 
 	nodeMutex.Lock()
 	defer nodeMutex.Unlock()
 
 	if node, exists := nodes[id]; exists {
+		node.Connect()
 		return node, nil
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	host, client, err := startNode(ctx, config)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 
-	node := NodeConcrete{id, host, client}
+	go func() {
+		err := connectToPeers(ctx, host, config.BootstrapPeers)
+		if err != nil {
+			fmt.Printf("failed to connect to peers: %s\n", err)
+		}
+	}()
+
+	node := &NodeConcrete{id, cancel, 1, host, client}
 
 	nodes[id] = node
 	return node, nil
@@ -177,4 +164,42 @@ func startClient(ctx context.Context, host host.Host) *bsclient.Client {
 	network.Start(client)
 
 	return client
+}
+
+func connectToPeers(ctx context.Context, host host.Host, peers []string) error {
+	var wg sync.WaitGroup
+	peerInfos := make(map[peer.ID]*peer.AddrInfo, len(peers))
+	for _, addrStr := range peers {
+		addr, err := multiaddr.NewMultiaddr(addrStr)
+		if err != nil {
+			return err
+		}
+
+		pii, err := peer.AddrInfoFromP2pAddr(addr)
+		if err != nil {
+			return err
+		}
+
+		pi, ok := peerInfos[pii.ID]
+		if !ok {
+			pi = &peer.AddrInfo{ID: pii.ID}
+			peerInfos[pi.ID] = pi
+		}
+
+		pi.Addrs = append(pi.Addrs, pii.Addrs...)
+	}
+
+	wg.Add(len(peerInfos))
+	for _, peerInfo := range peerInfos {
+		go func(peerInfo *peer.AddrInfo) {
+			defer wg.Done()
+			err := host.Connect(ctx, *peerInfo)
+			if err != nil {
+				fmt.Printf("failed to connect to %s: %s", peerInfo.ID, err)
+			}
+		}(peerInfo)
+	}
+	wg.Wait()
+
+	return nil
 }
