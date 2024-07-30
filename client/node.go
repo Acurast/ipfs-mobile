@@ -35,12 +35,12 @@ type Node interface {
 }
 
 type NodeConcrete struct {
-	id 		  string
-	cancel 	  context.CancelFunc
+	id        string
+	cancel    context.CancelFunc
 	connected int
 
-	host 	  host.Host
-	client 	  *bsclient.Client
+	host      host.Host
+	client    *bsclient.Client
 }
 
 type NodeConfig struct {
