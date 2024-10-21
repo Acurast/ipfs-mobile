@@ -10,6 +10,7 @@ import (
 type Config struct {
 	BootstrapPeers string
 	Port           int32
+	SizeLimit      int64
 	Timeout        int64
 }
 
@@ -26,7 +27,8 @@ func Get(cid string, output string, config *Config) error {
 	}
 
 	execConfig := &client.ExecConfig{
-		Timeout: optTimeout,
+		SizeLimit: config.SizeLimit,
+		Timeout:   optTimeout,
 	}
 
 	return client.Get(cid, output, nodeConfig, execConfig)
