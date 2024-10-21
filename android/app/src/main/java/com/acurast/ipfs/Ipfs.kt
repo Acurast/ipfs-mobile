@@ -11,20 +11,24 @@ import kotlin.time.Duration
 
 public class Ipfs(private val bootstrapNodes: List<String> = emptyList(), private val port: Int = PORT) {
 
-    public suspend fun get(cid: String, context: Context, timeout: Duration? = null): File =
-        get(cid, File(context.ipfsDataDir, cid), timeout)
+    public suspend fun get(cid: String, context: Context, sizeLimit: Long? = null, timeout: Duration? = null): File =
+        get(cid, File(context.ipfsDataDir, cid), sizeLimit, timeout)
 
-    public suspend fun get(cid: String, output: File, timeout: Duration? = null): File = withContext(Dispatchers.IO) {
+    public suspend fun get(cid: String, output: File, sizeLimit: Long? = null, timeout: Duration? = null): File = withContext(Dispatchers.IO) {
         try {
             Ffi.get(cid, output.absolutePath, Config().also {
                 it.bootstrapPeers = bootstrapNodes.joinToString(DELIMITER_LIST_STRING)
                 it.port = port
+                it.sizeLimit = sizeLimit ?: -1L
                 it.timeout = timeout?.inWholeMilliseconds ?: -1L
             })
 
             output
         } catch (e: Throwable) {
-            throw IOException(e.message, e.cause)
+            when {
+                e.message?.startsWith("size limit exceeded") == true -> throw SizeLimitExceededException(e.message, e.cause)
+                else -> throw IOException(e.message, e.cause)
+            }
         }
     }
 

@@ -29,7 +29,7 @@ import (
 )
 
 type Node interface {
-	Download(ctx context.Context, cidStr string, output string) error
+	Download(ctx context.Context, cidStr string, output string, sizeLimit int64) error
 	Connect()
 	Close()
 }
@@ -48,7 +48,7 @@ type NodeConfig struct {
 	Port           int32
 }
 
-func (node NodeConcrete) Download(ctx context.Context, cidStr string, output string) error {
+func (node NodeConcrete) Download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
 	bserv := blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), node.client)
 	session := merkledag.NewSession(ctx, merkledag.NewDAGService(bserv))
 	dserv := merkledag.NewReadOnlyDagService(session)
@@ -61,6 +61,17 @@ func (node NodeConcrete) Download(ctx context.Context, cidStr string, output str
 	unixfsnd, err := unixfile.NewUnixfsFile(ctx, dserv, nd)
 	if err != nil {
 		return err
+	}
+
+	if sizeLimit > 0 {
+		size, err := unixfsnd.Size()
+		if err != nil {
+			return err
+		}
+
+		if size > sizeLimit {
+			return fmt.Errorf("size limit exceeded (actual size = %d limit = %d bytes)", size, sizeLimit)
+		}
 	}
 
 	return files.WriteTo(unixfsnd, output)
