@@ -8,7 +8,8 @@ import (
 )
 
 type ExecConfig struct {
-	Timeout *time.Duration
+	SizeLimit int64
+	Timeout   *time.Duration
 }
 
 func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConfig) error {
@@ -22,7 +23,7 @@ func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConf
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		return node.Download(ctx, cid, output)
+		return node.Download(ctx, cid, output, execConfig.SizeLimit)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *execConfig.Timeout)
@@ -31,7 +32,7 @@ func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConf
 	result := make(chan error, 1)
 
 	go func() {
-		result <- node.Download(ctx, cid, output)
+		result <- node.Download(ctx, cid, output, execConfig.SizeLimit)
 	}()
 
 	select {
