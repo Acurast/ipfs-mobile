@@ -1,0 +1,116 @@
+#!/bin/bash
+
+CURR_DIR=$(dirname "${BASH_SOURCE[0]}")
+PLATFORM=$1
+
+function usage () {
+    echo "Usage: $0 <android|ios>"
+    echo ""
+    echo "Arguments:"
+    echo "  android    Build for Android platform"
+    echo "  ios        Build for iOS platform"
+    exit 1
+}
+
+function check_tools () {
+    echo "Checking the environment..."
+
+    echo "  [tools]"
+    if which go >/dev/null; then
+        echo -e "    \xE2\x9C\x94 go"
+    else
+        echo -e "    \xE2\x9C\x97 go"
+        ERROR="go has not been found"
+    fi
+    if which gomobile >/dev/null; then
+        echo -e "    \xE2\x9C\x94 gomobile"
+    else
+        echo -e "    \xE2\x9C\x97 gomobile"
+        ERROR="gomobile has not been found"
+    fi
+
+    if [[ -n "${ERROR}" ]]; then
+        echo "Error: $ERROR."
+        exit 1
+    fi
+}
+
+function check_android_env () {
+    echo "  [variables]"
+    if [[ -z "${ANDROID_HOME}" ]]; then
+        echo -e "    \xE2\x9C\x97 ANDROID_HOME"
+        ERROR="ANDROID_HOME has not been set"
+    else
+        echo -e "    \xE2\x9C\x94 ANDROID_HOME"
+    fi
+
+    if [[ -z "${ANDROID_NDK_HOME}" ]]; then
+        echo -e "    \xE2\x9C\x97 ANDROID_NDK_HOME"
+        ERROR="ANDROID_NDK_HOME has not been set"
+    else
+        echo -e "    \xE2\x9C\x94 ANDROID_NDK_HOME"
+    fi
+
+    if [[ -n "${ERROR}" ]]; then
+        echo "Error: $ERROR."
+        exit 1
+    fi
+}
+
+function init () {
+    echo "Initializing gomobile tools..."
+    gomobile init
+}
+
+function bind_android () {
+    echo "Binding with gomobile for Android..."
+
+    go get golang.org/x/mobile
+
+    ANDROID_API=$(grep "minSdk" $CURR_DIR/android/app/build.gradle.kts | awk '{print $3}' | tr -d "'\"" )
+    echo "  [android]"
+    echo -en "    / API $ANDROID_API"
+    if gomobile bind -o $CURR_DIR/android/ffi/ipfs.aar -target=android/arm,android/arm64 -androidapi $ANDROID_API $CURR_DIR/ffi; then
+        echo -e "\r    \xE2\x9C\x94 API $ANDROID_API"
+    else
+        echo -e "\r    \xE2\x9C\x97 API $ANDROID_API"
+    fi
+
+    go mod tidy
+}
+
+function bind_ios () {
+    echo "Binding with gomobile for iOS..."
+
+    go get golang.org/x/mobile
+
+    gomobile bind -o $CURR_DIR/IPFS.xcframework -target=ios $CURR_DIR/ffi
+
+    go mod tidy
+}
+
+# Validate platform argument
+if [[ -z "${PLATFORM}" ]]; then
+    echo "Error: Platform argument is required."
+    usage
+fi
+
+case "${PLATFORM}" in
+    android)
+        check_tools
+        check_android_env
+        init
+        bind_android
+        ;;
+    ios)
+        check_tools
+        init
+        bind_ios
+        ;;
+    *)
+        echo "Error: Invalid platform '${PLATFORM}'."
+        usage
+        ;;
+esac
+
+echo -e "\nDone."
