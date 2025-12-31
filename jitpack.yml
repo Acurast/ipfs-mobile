@@ -6,5 +6,5 @@ before_install:
   - export PATH=$PATH:~/go/bin
   - export ANDROID_NDK_HOME=$ANDROID_HOME/ndk-bundle
   - go install golang.org/x/mobile/cmd/gomobile@latest
-  - chmod 755 build_ffi.sh && ./build_ffi.sh
+  - chmod 755 build_ffi && ./build_ffi android
   - cd ./android
