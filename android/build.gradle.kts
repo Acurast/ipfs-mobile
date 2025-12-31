@@ -6,5 +6,5 @@ plugins {
 
 subprojects {
     group = "com.acurast.ipfs"
-    version = "1.1.1-beta01"
+    version = "1.1.1"
 }
