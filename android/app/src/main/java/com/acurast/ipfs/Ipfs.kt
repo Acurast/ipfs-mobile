@@ -12,38 +12,24 @@ import kotlin.time.Duration.Companion.seconds
 import ffi.Client as FfiClient
 
 /**
- * A reusable IPFS client.
+ * A reusable IPFS client, safe to share between coroutines. The node is started
+ * on the first download and reused by later ones.
  *
- * The underlying node is started on the first download and reused by later ones,
- * so bootstrap peers are dialled once rather than on every fetch.
+ * [idleTimeout] shuts the node down once it has been unused for that long,
+ * restarting it on the next download; `null` keeps it up until [close].
  *
- * Its lifetime is yours to choose:
+ * [delegatedRouting] queries a delegated routing v1 endpoint such as
+ * `https://cid.contact` alongside the DHT. It finds content that is indexed but
+ * never announced to the DHT; in exchange the endpoint learns which CIDs this
+ * device fetches. Off by default.
  *
- *  - leave [idleTimeout] at its default and the node shuts itself down once it
- *    has been unused for that long, restarting on the next download. Nothing
- *    else is required, though [close] is still honoured.
- *  - pass `null` for [idleTimeout] to keep the node up until you [close] it,
- *    which suits a long lived client that fetches often.
+ * [gateways] are HTTP gateways fetched from alongside libp2p peers and verified
+ * like any other source.
  *
- * Content is located through the DHT. Set [delegatedRouting] to additionally
- * query a delegated routing v1 endpoint, an IPNI indexer such as
- * `https://cid.contact`. That matters because large pinning services publish to
- * an indexer rather than announcing every CID to the DHT, so some content is
- * findable no other way. The trade is that the endpoint learns which CIDs this
- * device fetches, so point it at one you run if that matters to you. Off by
- * default.
- *
- * [gateways] are HTTP gateways fetched from alongside libp2p peers. What they
- * return is verified block by block, so adding them costs nothing in trust.
- *
- * [allowUnverifiedGatewayFallback] additionally permits a last-resort whole-file
- * fetch from those gateways once every verified route has failed. Understand the
- * trade before enabling it: a whole-file response CANNOT be checked against its
- * CID, so that content is trusted purely because the gateway said so. It exists
- * because some gateways serve files but not blocks, and content that arrives
- * unverified may still beat no content at all.
- *
- * Instances are safe to share between coroutines.
+ * [allowUnverifiedGatewayFallback] permits a whole-file fetch from those
+ * gateways once every verified route has failed. Such a response cannot be
+ * checked against its CID and is trusted because the gateway served it. Enable
+ * it when unverified content still beats none.
  */
 public class Ipfs(
     private val bootstrapNodes: List<String> = emptyList(),
@@ -54,6 +40,15 @@ public class Ipfs(
     private val allowUnverifiedGatewayFallback: Boolean = false,
 ) : Closeable {
 
+    // A monitor rather than a coroutine Mutex: close() overrides
+    // Closeable.close() and so cannot suspend, yet it guards the same state
+    // client() does. Mutex.withLock needs a suspend context, and runBlocking in
+    // close() can deadlock on an exhausted dispatcher - which `use { }` supplies.
+    //
+    // Only correct while the guarded blocks never suspend, since a monitor
+    // belongs to a thread and a coroutine may resume on another. Keep them free
+    // of I/O; needing to await in here means dropping Closeable for a suspend
+    // close() and switching to a Mutex.
     private val lock = Any()
     private var client: FfiClient? = null
     private var closed: Boolean = false
@@ -91,14 +86,16 @@ public class Ipfs(
             client.also { client = null }
         }
 
+        // Outside the lock: teardown waits on libp2p, bitswap and the DHT, and
+        // holding the monitor across it would block every concurrent get().
         running?.close()
     }
 
     private fun client(): FfiClient = synchronized(lock) {
         if (closed) throw IOException("IPFS client is closed")
 
-        // Cheap: this only validates the peer list, it does not touch the
-        // network. The node itself comes up on the first download.
+        // Only validates the configured lists; the node comes up on the first
+        // download.
         client ?: Ffi.newClient(
             bootstrapNodes.joinToString(DELIMITER_LIST_STRING),
             port,
@@ -127,15 +124,13 @@ public class Ipfs(
 
         /**
          * Long enough that a burst of downloads reuses one set of connections,
-         * short enough that an idle app is not left holding sockets open.
+         * short enough that an idle app stops holding sockets open.
          */
         private val IDLE_TIMEOUT: Duration = 30.seconds
 
-        /** The FFI encodes "no limit" and "no timeout" as a negative value. */
+        /** The FFI encodes "no limit" and "no timeout" as negative, "no endpoint" as empty. */
         private const val NO_SIZE_LIMIT = -1L
         private const val NO_TIMEOUT = -1L
-
-        /** ...and "no delegated routing endpoint" as an empty string. */
         private const val NO_DELEGATED_ROUTING = ""
 
         private const val DIR_IPFS = "ipfs"

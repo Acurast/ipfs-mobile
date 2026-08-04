@@ -1,13 +1,12 @@
 //go:build integration
 
-// Live tests against the public IPFS network. They need working egress and
-// reachable bootstrap peers, so they are kept behind a build tag:
+// Live tests against the public IPFS network, behind a build tag because they
+// need egress and reachable peers:
 //
 //	go test ./...                     # unit tests only
 //	go test -tags=integration ./...   # and these
 //
-// Override the defaults with IPFS_TEST_BOOTSTRAP (a ";" separated peer list)
-// and IPFS_TEST_CID.
+// IPFS_TEST_BOOTSTRAP (";" separated) and IPFS_TEST_CID override the defaults.
 package client
 
 import (
@@ -24,11 +23,9 @@ import (
 	"context"
 )
 
-// treeDigest walks output, which may be a single file or a UnixFS directory, and
-// returns the total bytes together with a stable digest of the whole tree.
-//
-// The default CID is a directory, so this also gives the directory branch of
-// files.WriteTo its only coverage anywhere in the suite.
+// treeDigest walks output, a file or a UnixFS directory, and returns its total
+// size with a stable digest. The default CID is a directory, so this is also the
+// only coverage of that branch of files.WriteTo.
 func treeDigest(t *testing.T, root string) (int64, string) {
 	t.Helper()
 
@@ -67,10 +64,9 @@ func treeDigest(t *testing.T, root string) (int64, string) {
 	return total, hex.EncodeToString(hash.Sum(nil))
 }
 
-// Mirrors Constants.IPFS_BOOTSTRAP_NODES in acurast-data-transmitter, minus the
-// Pinata bitswap gateway. These are DHT bootstrap nodes: they hold no content
-// themselves, so retrieving anything through them exercises the DHT provider
-// lookup end to end.
+// Mirrors Constants.IPFS_BOOTSTRAP_NODES in acurast-data-transmitter, minus
+// Pinata. These hold no content themselves, so retrieving through them exercises
+// content routing end to end.
 var defaultLivePeers = []string{
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
@@ -80,14 +76,9 @@ var defaultLivePeers = []string{
 	"/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 }
 
-// The readme shipped with every kubo init, so it is about the most widely
-// replicated and announced content on the public network.
-//
-// Deliberately not the processor's own health-check CID
-// (QmSHJwK2EW2Ruq4bZUTNyMxw37Rx6bZjyaqwXrJ7i63EhQ): measured against the public
-// DHT that one resolves to zero providers, because whoever pins it serves it
-// over a direct bitswap connection without publishing provider records. It is
-// therefore unreachable by content routing, and useless for testing it.
+// The readme shipped with every kubo init, so about the most widely announced
+// content there is. Not the processor's own health-check CID, which resolves to
+// zero DHT providers and so cannot exercise the DHT at all.
 const defaultLiveCID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
 
 // Public IPFS retrieval is slow and variable; these are deliberately generous.
@@ -112,11 +103,8 @@ func liveCID() string {
 	return defaultLiveCID
 }
 
-// connectedPeers reports how many peers the client's node currently holds.
-//
-// Live failures are almost always one of two things, and this tells them apart:
-// zero peers means connectivity or DNS, peers but no content means the CID is
-// not retrievable right now. Without it every failure just reads "timeout".
+// connectedPeers tells the two usual live failures apart: zero peers means
+// connectivity or DNS, peers but no content means the CID is not retrievable.
 func connectedPeers(client *Client) int {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
@@ -159,8 +147,7 @@ func TestLiveDownload(t *testing.T) {
 	t.Logf("fetched %d bytes for %s", total, liveCID())
 }
 
-// The second fetch reuses the already connected node, which is the point of the
-// handle: it should be markedly faster than the cold one.
+// The second fetch reuses the connected node, so it should be markedly faster.
 func TestLiveDownloadReusesConnections(t *testing.T) {
 	client := liveClient(t, 0)
 
@@ -191,17 +178,15 @@ func TestLiveDownloadReusesConnections(t *testing.T) {
 	}
 }
 
-// The bug this all started from: against real peers, a call with a deadline has
-// to come back at that deadline rather than running long.
+// A call with a deadline has to come back at that deadline against real peers.
 func TestLiveTimeoutIsHonoured(t *testing.T) {
 	client := liveClient(t, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), liveShortTimeout)
 	defer cancel()
 
-	// The CID of content that has never been published: sha256 of a sentinel
-	// string, as raw CIDv1. Nobody can serve it, so the call runs until the
-	// deadline rather than finishing early.
+	// Never published: sha256 of a sentinel string as a raw CIDv1, so nobody can
+	// serve it and the call runs to the deadline.
 	const unfindable = "bafkreif3r4evobsxhtfza6zgi7jz2jqv4bqxqs5wn6hies6ejzchufc66y"
 
 	start := time.Now()
@@ -252,9 +237,8 @@ func TestLiveIdleShutdownAndRestart(t *testing.T) {
 	}
 }
 
-// Every configured bootstrap peer should be dialable. Failures here are a
-// problem with the peer list rather than with this package, so they are logged
-// individually.
+// A failure here is a problem with the peer list, not with this package, so each
+// peer is logged individually.
 func TestLiveBootstrapPeersAreReachable(t *testing.T) {
 	peers, err := parsePeers(livePeers())
 	if err != nil {
@@ -289,12 +273,12 @@ func TestLiveBootstrapPeersAreReachable(t *testing.T) {
 	}
 }
 
-// The CID that started this: served by Pinata, indexed by cid.contact, and
-// absent from the DHT. It is the case delegated routing exists to cover.
+// Served by Pinata and indexed by cid.contact, but absent from the DHT: the case
+// delegated routing exists to cover.
 const pinataOnlyCID = "QmSHJwK2EW2Ruq4bZUTNyMxw37Rx6bZjyaqwXrJ7i63EhQ"
 
-// Retrieving it proves the indexer path works against the real network, with
-// Pinata nowhere in the bootstrap list.
+// Proves the indexer path works against the real network, with Pinata nowhere in
+// the bootstrap list.
 func TestLiveDelegatedRoutingFindsIndexedOnlyContent(t *testing.T) {
 	client, err := New(&Config{
 		BootstrapPeers:           livePeers(),
@@ -322,8 +306,7 @@ func TestLiveDelegatedRoutingFindsIndexedOnlyContent(t *testing.T) {
 	t.Logf("fetched %d bytes in %v via cid.contact: %q", len(content), time.Since(start).Truncate(time.Millisecond), strings.TrimSpace(string(content)))
 }
 
-// The control: the same CID with only the DHT configured. It is not announced
-// there, so this cannot succeed.
+// The control for the test above.
 func TestLiveDHTAloneCannotFindIndexedOnlyContent(t *testing.T) {
 	client := liveClient(t, 0)
 
@@ -338,8 +321,7 @@ func TestLiveDHTAloneCannotFindIndexedOnlyContent(t *testing.T) {
 	t.Logf("dht alone: %v (%d peers connected)", err, connectedPeers(client))
 }
 
-// The default gateway list from Constants.IPFS_GATEWAYS in
-// acurast-data-transmitter, so these exercise what the processor really uses.
+// Mirrors Constants.IPFS_GATEWAYS in acurast-data-transmitter.
 var defaultLiveGateways = []string{
 	"https://ipfs.io",
 	"https://dweb.link",
@@ -347,18 +329,13 @@ var defaultLiveGateways = []string{
 	"https://ipfs.filebase.io",
 }
 
-// Surveys which of the configured gateways actually serve verified blocks.
+// Surveys which configured gateways actually serve verified blocks, rather than
+// asserting it: the answer is a property of someone else's infrastructure, and
+// our side is covered offline by TestGatewayServesVerifiedBlocks.
 //
-// Written as a survey rather than an assertion because the answer is a property
-// of someone else's infrastructure, not of this library: our side is covered
-// offline by TestGatewayServesVerifiedBlocks against a local trustless gateway.
-// Asserting here just produced a test that failed whenever a third party had a
-// bad minute.
-//
-// The result is worth recording. Verified retrieval is patchy in practice:
-// subdomain gateways answer /ipfs/<cid>?format=raw with a 301 that httpnet does
-// not follow, and at least one has sent HTTP/2 headers larger than Go's client
-// accepts. That is precisely why the unverified fallback exists.
+// Support is patchy. Subdomain gateways answer the block request with a 301 that
+// httpnet does not follow, and at least one sends HTTP/2 headers larger than Go
+// accepts. Hence the unverified fallback.
 func TestLiveGatewayVerifiedBlockSupport(t *testing.T) {
 	var supported []string
 
@@ -394,7 +371,7 @@ func TestLiveGatewayVerifiedBlockSupport(t *testing.T) {
 	}
 }
 
-// Everything at once, which is the configuration a processor would actually run.
+// The configuration a processor would actually run.
 func TestLiveAllRoutesTogether(t *testing.T) {
 	client, err := New(&Config{
 		BootstrapPeers:                 livePeers(),

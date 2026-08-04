@@ -31,8 +31,7 @@ func newClient(t *testing.T, config *Config) *Client {
 	return client
 }
 
-// servedClient returns a Client bootstrapped against an in-process peer serving
-// content, along with the root CID and the content itself.
+// servedClient returns a Client bootstrapped against a peer serving content.
 func servedClient(t *testing.T, size int) (*Client, string, []byte) {
 	t.Helper()
 
@@ -42,9 +41,8 @@ func servedClient(t *testing.T, size int) (*Client, string, []byte) {
 	return newClient(t, &Config{BootstrapPeers: []string{addr}}), root, content
 }
 
-// blockedClient returns a Client connected to a real peer that does not hold
-// unreachableCID. Connecting succeeds, so the download itself is what blocks -
-// which is what the timeout and teardown tests need to exercise.
+// blockedClient connects to a real peer that does not hold unreachableCID, so
+// the download blocks rather than the connection.
 func blockedClient(t *testing.T, config *Config) *Client {
 	t.Helper()
 
@@ -74,8 +72,6 @@ func TestGetDownloadsContent(t *testing.T) {
 	}
 }
 
-// The node is started once and reused, so bootstrap peers are not re-dialled on
-// every fetch. That reuse is the whole point of the handle.
 func TestGetReusesTheNodeAcrossDownloads(t *testing.T) {
 	client, root, content := servedClient(t, 2048)
 
@@ -168,8 +164,6 @@ func TestGetEnforcesSizeLimit(t *testing.T) {
 		t.Errorf("expected a size limit error, got %v", err)
 	}
 
-	// The Kotlin wrapper keys SizeLimitExceededException off this prefix, and it
-	// must not have written anything.
 	if _, err := os.Stat(output); !os.IsNotExist(err) {
 		t.Error("output was written despite exceeding the size limit")
 	}
@@ -187,8 +181,7 @@ func TestGetAllowsContentAtTheSizeLimit(t *testing.T) {
 	}
 }
 
-// A timed out download must not leave a partial file behind, and must not
-// clobber content already at the output path.
+// A failed download must not clobber content already at the output path.
 func TestGetLeavesOutputIntactOnTimeout(t *testing.T) {
 	client := blockedClient(t, &Config{})
 
@@ -214,9 +207,8 @@ func TestGetLeavesOutputIntactOnTimeout(t *testing.T) {
 	}
 }
 
-// The deadline has to bound the whole call, including node startup, which dials
-// bootstrap peers and is usually the slowest part of a cold fetch. The peer here
-// stalls mid-handshake, so the call is stuck in startup when the deadline hits.
+// The peer stalls mid-handshake, so the call is still in startup when the
+// deadline hits.
 func TestGetIsBoundedByDeadlineIncludingStartup(t *testing.T) {
 	client := newClient(t, &Config{BootstrapPeers: []string{testpeer.Stalled(t)}})
 
@@ -236,9 +228,6 @@ func TestGetIsBoundedByDeadlineIncludingStartup(t *testing.T) {
 	}
 }
 
-// When no peer is reachable the call reports that immediately rather than
-// blocking until the deadline. The Kotlin wrapper falls back to HTTP gateways on
-// failure, so a fast, specific error gets that fallback going sooner.
 func TestGetFailsFastWhenNoPeerIsReachable(t *testing.T) {
 	client := newClient(t, &Config{BootstrapPeers: []string{deadPeer}})
 
@@ -278,7 +267,6 @@ func TestGetReportsDeadlineAsTimeout(t *testing.T) {
 	}
 }
 
-// Cancellation is not a timeout and must not be reported as one.
 func TestGetReportsCancellationDistinctly(t *testing.T) {
 	client := newClient(t, &Config{BootstrapPeers: []string{testpeer.Stalled(t)}})
 
@@ -295,8 +283,6 @@ func TestGetReportsCancellationDistinctly(t *testing.T) {
 	}
 }
 
-// A malformed CID used to reach cid.MustParse on a background goroutine, where
-// the panic was unrecoverable and took the process with it.
 func TestGetRejectsMalformedCID(t *testing.T) {
 	client, _, _ := servedClient(t, 512)
 
@@ -342,8 +328,7 @@ func TestCloseIsIdempotentAndBlocksFurtherUse(t *testing.T) {
 	}
 }
 
-// Close must not hang while a download is in flight, and must not deadlock
-// against it. The download itself is expected to fail once the node goes away.
+// The in-flight download is expected to fail once the node goes away.
 func TestCloseDuringDownloadDoesNotDeadlock(t *testing.T) {
 	client := blockedClient(t, &Config{})
 
@@ -428,7 +413,6 @@ func TestIdleTimeoutClosesTheNodeAndItRestarts(t *testing.T) {
 	}
 }
 
-// With no idle timeout the caller owns the lifetime, so the node must stay up.
 func TestIdleTimeoutDisabledKeepsTheNodeRunning(t *testing.T) {
 	client, root, _ := servedClient(t, 1024)
 
@@ -452,8 +436,6 @@ func TestIdleTimeoutDisabledKeepsTheNodeRunning(t *testing.T) {
 	}
 }
 
-// An in-flight download must keep the idle timer from tearing the node out from
-// under it.
 func TestIdleTimeoutDoesNotFireDuringADownload(t *testing.T) {
 	client := blockedClient(t, &Config{IdleTimeout: 50 * time.Millisecond})
 
@@ -507,7 +489,6 @@ func TestNewRejectsUnusableBootstrapLists(t *testing.T) {
 	}
 }
 
-// One malformed entry must not discard the rest of the list.
 func TestNewSkipsInvalidPeersButKeepsValidOnes(t *testing.T) {
 	content := testpeer.Content(1024)
 	addr, root := testpeer.Serve(t, content)
@@ -567,8 +548,6 @@ func TestConnectToPeersFailsWhenNoneAnswer(t *testing.T) {
 	}
 }
 
-// connectToPeers returns as soon as one peer answers rather than waiting for
-// every dial, so one dead entry must not hold up a working one.
 func TestConnectToPeersReturnsOnFirstReachable(t *testing.T) {
 	addr, _ := testpeer.Serve(t, testpeer.Content(64))
 
@@ -613,7 +592,6 @@ func TestPackageGetFetchesAndCleansUp(t *testing.T) {
 	}
 }
 
-// The staging directory used for the atomic write must never be left behind.
 func TestDownloadLeavesNoScratchDirectories(t *testing.T) {
 	client, root, _ := servedClient(t, 2048)
 

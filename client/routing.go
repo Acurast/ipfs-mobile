@@ -16,24 +16,14 @@ import (
 const userAgent = "ipfs-mobile"
 
 // newDelegatedRouter builds a content router backed by a delegated routing v1
-// HTTP endpoint, such as an IPNI indexer.
-//
-// This exists because the DHT is not the whole picture. Announcing to the DHT
-// costs roughly twenty PUTs per CID, republished twice a day, so large pinning
-// services publish to an indexer instead. Content indexed only there is
-// invisible to a DHT-only client even though public gateways find it easily.
-//
-// Every lookup tells the endpoint which CID is being fetched, which is why this
-// is off unless the caller names an endpoint.
+// endpoint, which finds content that is indexed but never announced to the DHT.
 func newDelegatedRouter(endpoint string) (routing.ContentDiscovery, error) {
 	delegated, err := routinghttp.New(
 		endpoint,
 		routinghttp.WithUserAgent(userAgent),
 		routinghttp.WithHTTPClient(&http.Client{Transport: jsonOnlyTransport{}}),
-		// boxo defaults to {"unknown", "transport-bitswap"}, which throws away
-		// gateway records. cid.contact returns both kinds for the same content -
-		// a bitswap peer and an HTTP gateway - and since the exchange now speaks
-		// HTTP too, discarding the gateway would discard a working route.
+		// Wider than boxo's default, which keeps only bitswap peers. Indexers
+		// return HTTP gateways for the same content and the exchange can use them.
 		routinghttp.WithProtocolFilter([]string{
 			"unknown",
 			"transport-bitswap",
@@ -50,17 +40,10 @@ func newDelegatedRouter(endpoint string) (routing.ContentDiscovery, error) {
 // jsonOnlyTransport forces Accept: application/json on delegated routing
 // requests.
 //
-// boxo asks for "application/x-ndjson,application/json", preferring to stream
-// results. cid.contact, which is the indexer most delegated routing endpoints
-// front, answers 404 to any Accept that mentions ndjson instead of negotiating
-// down to JSON. The routing client reads that 404 as "no providers", so every
-// lookup silently returns nothing at all:
-//
-//	Accept: application/x-ndjson,application/json  ->  404
-//	Accept: application/json                       ->  200
-//
-// Giving up streaming costs nothing here, because a provider list is small
-// enough to arrive in one response either way.
+// boxo prefers to stream and asks for ndjson. cid.contact answers 404 to any
+// Accept mentioning ndjson rather than negotiating down, and the routing client
+// reads that 404 as "no providers" - so every lookup silently finds nothing.
+// Streaming is no loss here; a provider list arrives in one response anyway.
 type jsonOnlyTransport struct {
 	inner http.RoundTripper
 }
@@ -78,9 +61,8 @@ func (transport jsonOnlyTransport) RoundTrip(request *http.Request) (*http.Respo
 	return inner.RoundTrip(forwarded)
 }
 
-// newProviderFinder composes the configured routers into the single
-// ContentDiscovery that bitswap asks for. A nil result means no content routing
-// at all, leaving bitswap able to fetch only from directly connected peers.
+// newProviderFinder composes the configured routers into the one bitswap asks
+// for. Nil means no content routing at all: only directly connected peers.
 func newProviderFinder(routers ...routing.ContentDiscovery) routing.ContentDiscovery {
 	configured := make([]routing.ContentDiscovery, 0, len(routers))
 	for _, router := range routers {
@@ -93,18 +75,15 @@ func newProviderFinder(routers ...routing.ContentDiscovery) routing.ContentDisco
 	case 0:
 		return nil
 	case 1:
-		// Skip the fan-out machinery when there is nothing to fan out to.
 		return configured[0]
 	default:
 		return parallelDiscovery(configured)
 	}
 }
 
-// parallelDiscovery queries every router at once and merges the results.
-//
-// The DHT and an indexer know about largely different content, and either can be
-// slow, so asking them in sequence would add one timeout to the other for
-// content the first one was never going to find.
+// parallelDiscovery queries every router at once and merges the results. The
+// routers know about largely different content and either can be slow, so
+// asking in sequence would add one timeout to the other.
 type parallelDiscovery []routing.ContentDiscovery
 
 func (routers parallelDiscovery) FindProvidersAsync(ctx context.Context, key cid.Cid, limit int) <-chan peer.AddrInfo {
@@ -137,7 +116,6 @@ func (routers parallelDiscovery) FindProvidersAsync(ctx context.Context, key cid
 					satisfied := limit > 0 && len(seen) >= limit
 					mutex.Unlock()
 
-					// A provider is often known to more than one router.
 					if duplicate {
 						continue
 					}
@@ -149,7 +127,7 @@ func (routers parallelDiscovery) FindProvidersAsync(ctx context.Context, key cid
 					}
 
 					if satisfied {
-						// Enough providers found; stop the sibling routers too.
+						// Stop the sibling routers too.
 						cancel()
 						return
 					}

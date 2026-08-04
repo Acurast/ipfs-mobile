@@ -11,17 +11,11 @@ import (
 	multihash "github.com/multiformats/go-multihash"
 )
 
-// parseGateways turns gateway URLs into peers that the HTTP exchange can talk
-// to, so a gateway is fetched from as a peer rather than as a special case.
+// parseGateways turns gateway URLs into peers the exchange can talk to.
 //
-// Every gateway needs a peer ID because that is how bitswap keys a peer, but a
-// trustless gateway has no libp2p identity to offer. httpnet never asks for one:
-// it probes the URL and remembers what answered. So the ID here is a
-// deterministic synthetic derived from the URL, used purely as a map key.
-//
-// Nothing trusts it. Safety on this path comes from hashing each returned block
-// against the CID that was requested, which is what makes fetching from an
-// anonymous HTTP endpoint sound at all.
+// A gateway has no libp2p identity, so its ID is synthesised from the URL and
+// used purely as a map key. Nothing trusts it: what makes an anonymous endpoint
+// safe to fetch from is hashing each block against the CID that asked for it.
 func parseGateways(gateways []string) ([]peer.AddrInfo, error) {
 	peers := make([]peer.AddrInfo, 0, len(gateways))
 
@@ -48,8 +42,8 @@ func parseGateways(gateways []string) ([]peer.AddrInfo, error) {
 	return peers, nil
 }
 
-// gatewayMultiaddr renders a gateway URL in the form the HTTP exchange expects,
-// for example https://ipfs.io -> /dns4/ipfs.io/tcp/443/https.
+// gatewayMultiaddr renders a gateway URL as the exchange expects it, for
+// example https://ipfs.io -> /dns4/ipfs.io/tcp/443/https.
 func gatewayMultiaddr(gateway string) (multiaddr.Multiaddr, error) {
 	parsed, err := url.Parse(gateway)
 	if err != nil {
@@ -73,9 +67,6 @@ func gatewayMultiaddr(gateway string) (multiaddr.Multiaddr, error) {
 		}
 	}
 
-	// boxo rejects plaintext http for anything that is not loopback or private,
-	// so a misconfigured public gateway fails here rather than silently
-	// downgrading.
 	protocol := "dns4"
 	if ip := net.ParseIP(host); ip != nil {
 		protocol = "ip4"
@@ -87,8 +78,8 @@ func gatewayMultiaddr(gateway string) (multiaddr.Multiaddr, error) {
 	return multiaddr.NewMultiaddr(fmt.Sprintf("/%s/%s/tcp/%s/%s", protocol, host, port, parsed.Scheme))
 }
 
-// gatewayPeerID derives a stable identifier for a gateway from its URL. See
-// parseGateways for why a synthetic one is sound here.
+// gatewayPeerID derives a stable identifier from the URL. See parseGateways for
+// why a synthetic one is sound.
 func gatewayPeerID(gateway string) (peer.ID, error) {
 	sum := sha256.Sum256([]byte(gateway))
 

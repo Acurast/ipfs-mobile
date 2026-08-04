@@ -6,13 +6,9 @@ PLATFORM=$1
 # -buildid= keeps the output reproducible.
 #
 # -checklinkname=0 restores the pre Go 1.23 //go:linkname rules. go-libp2p pulls
-# in github.com/wlynxg/anet through its WebRTC transport (via pion/ice), and anet
-# reaches into net.zoneCache with linkname, which the Go 1.23+ linker rejects:
-#
-#   link: github.com/wlynxg/anet: invalid reference to net.zoneCache
-#
-# anet v0.0.5 is the latest release and still does this, so until it is fixed
-# upstream this flag is what makes a mobile build possible at all.
+# in github.com/wlynxg/anet, which reaches into net.zoneCache by linkname and so
+# is rejected by the current linker. Without this the mobile build cannot link at
+# all; drop it once anet is fixed upstream.
 LDFLAGS="-buildid= -checklinkname=0"
 
 function usage () {

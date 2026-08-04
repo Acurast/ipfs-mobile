@@ -2,8 +2,8 @@ package utils
 
 import "testing"
 
-// The Kotlin wrapper turns anything that is not a size-limit error into an
-// IOException and surfaces this message, so the wording is part of the contract.
+// The Kotlin wrapper surfaces this message, so the wording is part of the
+// contract.
 func TestTimeout(t *testing.T) {
 	err := Timeout()
 

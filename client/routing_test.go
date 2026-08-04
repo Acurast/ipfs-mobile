@@ -16,12 +16,8 @@ import (
 	"ipfs-mobile/internal/testpeer"
 )
 
-// delegatedRouter stands up a routing v1 endpoint that answers provider lookups
-// for one CID with one provider, the way an IPNI indexer such as cid.contact
-// does. It reports how many lookups it served.
-//
-// This is what makes the delegated path testable offline: the shape of the
-// response is the contract, and it is the same shape cid.contact returns.
+// delegatedRouter stands up a routing v1 endpoint answering provider lookups for
+// one CID, in the shape cid.contact returns, and counts the lookups it serves.
 func delegatedRouter(t *testing.T, forCID string, provider string) (endpoint string, lookups *atomic.Int32) {
 	t.Helper()
 
@@ -73,12 +69,8 @@ func splitPeerAddr(t *testing.T, addr string) (id string, addrs []string) {
 	return addr[index+len(marker):], []string{addr[:index]}
 }
 
-// The whole point of delegated routing: content that no connected peer holds and
-// that is not announced to the DHT is still retrievable, because an indexer
-// knows who has it.
-//
-// This mirrors the real situation with Pinata-pinned content, which resolves to
-// zero providers on the DHT but is indexed by cid.contact.
+// Content no connected peer holds and the DHT does not know about is still
+// retrievable, because the indexer knows who has it.
 func TestDelegatedRoutingFindsUnannouncedContent(t *testing.T) {
 	content := testpeer.Content(4096)
 	bootstrapAddr, providerAddr, root := testpeer.ServeIsolated(t, content)
@@ -113,8 +105,7 @@ func TestDelegatedRoutingFindsUnannouncedContent(t *testing.T) {
 	}
 }
 
-// The control for the test above: same topology, same unannounced provider, but
-// with no indexer configured there is no way to find it.
+// The control for the test above.
 func TestWithoutAnyRoutingUnannouncedContentIsUnreachable(t *testing.T) {
 	content := testpeer.Content(4096)
 	bootstrapAddr, _, root := testpeer.ServeIsolated(t, content)
@@ -132,8 +123,6 @@ func TestWithoutAnyRoutingUnannouncedContentIsUnreachable(t *testing.T) {
 	}
 }
 
-// With both configured the two run side by side, so content only one of them
-// knows about is still found. Here the DHT knows nothing and the indexer does.
 func TestDHTAndDelegatedRoutingRunInParallel(t *testing.T) {
 	content := testpeer.Content(2048)
 	bootstrapAddr, providerAddr, root := testpeer.ServeIsolated(t, content)
@@ -174,8 +163,7 @@ func TestDHTAndDelegatedRoutingRunInParallel(t *testing.T) {
 	}
 }
 
-// A slow or dead indexer must not hold up a DHT lookup that would have
-// succeeded, which is the reason the routers are queried in parallel.
+// Which is why the routers are queried in parallel.
 func TestDelegatedRoutingDoesNotBlockTheDHT(t *testing.T) {
 	content := testpeer.Content(2048)
 	bootstrapAddr, root := testpeer.ServeViaDHT(t, content)
@@ -252,8 +240,6 @@ func TestDelegatedRoutingDisabledByDefault(t *testing.T) {
 	}
 }
 
-// newProviderFinder collapses to nil when nothing is configured, which is what
-// tells bitswap there is no content routing at all.
 func TestNewProviderFinderComposition(t *testing.T) {
 	if finder := newProviderFinder(nil, nil); finder != nil {
 		t.Errorf("newProviderFinder with no routers = %v, want nil", finder)

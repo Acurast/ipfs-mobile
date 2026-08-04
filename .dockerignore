@@ -1,11 +1,9 @@
 # Version control
 .git
 
-# Build outputs, all regenerated inside the container.
-#
-# The .aar in particular: it is gitignored, so a developer's local copy would
-# otherwise be baked into the image and a Gradle job could quietly assemble
-# against a stale bind instead of the one this pipeline built.
+# Build outputs, all regenerated inside the container. The .aar especially: it is
+# gitignored, so a local copy would otherwise be baked in and Gradle could
+# assemble against a stale bind.
 **/build
 **/.gradle
 **/.kotlin

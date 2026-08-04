@@ -13,8 +13,7 @@ import (
 	"ipfs-mobile/internal/testpeer"
 )
 
-// A gateway that serves blocks is fetched from like any other peer, and what it
-// returns is verified.
+// A gateway serving blocks is fetched from like any other peer, and verified.
 func TestGatewayServesVerifiedBlocks(t *testing.T) {
 	content := testpeer.Content(4096)
 	gateway, root, blockRequests := testpeer.ServeTrustlessGateway(t, content)
@@ -49,8 +48,6 @@ func TestGatewayServesVerifiedBlocks(t *testing.T) {
 	}
 }
 
-// The verified path is preferred: with a working gateway there is no reason to
-// touch the unverified fallback, even when it is enabled.
 func TestVerifiedGatewayPreemptsUnverifiedFallback(t *testing.T) {
 	content := testpeer.Content(2048)
 	gateway, root, blockRequests := testpeer.ServeTrustlessGateway(t, content)
@@ -84,8 +81,8 @@ func TestVerifiedGatewayPreemptsUnverifiedFallback(t *testing.T) {
 	}
 }
 
-// A gateway that only serves whole files is useless to the verified path, so
-// this is where the fallback earns its place.
+// A gateway that only serves whole files is useless to the verified path, which
+// is where the fallback earns its place.
 func TestUnverifiedFallbackFetchesFromWholeFileGateway(t *testing.T) {
 	content := testpeer.Content(4096)
 	_, root, _ := testpeer.ServeTrustlessGateway(t, content)
@@ -120,7 +117,7 @@ func TestUnverifiedFallbackFetchesFromWholeFileGateway(t *testing.T) {
 	}
 }
 
-// The control: the same unreachable content, with the fallback switched off.
+// The control for the test above.
 func TestWithoutFallbackWholeFileGatewayIsNotUsed(t *testing.T) {
 	content := testpeer.Content(4096)
 	_, root, _ := testpeer.ServeTrustlessGateway(t, content)
@@ -147,9 +144,9 @@ func TestWithoutFallbackWholeFileGatewayIsNotUsed(t *testing.T) {
 	}
 }
 
-// This is the cost of the fallback, stated as a test: content that does not
-// match the CID is accepted, because a whole-file response cannot be checked
-// against one. Anyone changing this behaviour should have to change this test.
+// The cost of the fallback, as a test: content that does not match the CID is
+// accepted, because a whole-file response cannot be checked against one.
+// Changing this behaviour should mean changing this test deliberately.
 func TestUnverifiedFallbackCannotDetectWrongContent(t *testing.T) {
 	content := testpeer.Content(4096)
 	_, root, _ := testpeer.ServeTrustlessGateway(t, content)
@@ -185,8 +182,7 @@ func TestUnverifiedFallbackCannotDetectWrongContent(t *testing.T) {
 	t.Log("substituted content accepted, as documented: a whole-file gateway response carries no proof it matches the CID")
 }
 
-// The size limit still applies on the unverified path, and stops the transfer
-// rather than only checking what the gateway claimed.
+// Enforced on the bytes that arrive, not on what the gateway claimed.
 func TestUnverifiedFallbackEnforcesSizeLimit(t *testing.T) {
 	content := testpeer.Content(8192)
 	_, root, _ := testpeer.ServeTrustlessGateway(t, content)
@@ -225,7 +221,6 @@ func TestUnverifiedFallbackEnforcesSizeLimit(t *testing.T) {
 	}
 }
 
-// A failed fallback must not bury why the verified attempt failed.
 func TestFallbackFailureReportsBothCauses(t *testing.T) {
 	bootstrapAddr, _, _ := testpeer.ServeIsolated(t, testpeer.Content(64))
 
@@ -264,7 +259,6 @@ func TestNewRejectsUnusableGatewayList(t *testing.T) {
 	}
 }
 
-// One bad entry must not discard the rest, matching how bootstrap peers behave.
 func TestNewSkipsInvalidGatewaysButKeepsValidOnes(t *testing.T) {
 	content := testpeer.Content(1024)
 	gateway, root, blockRequests := testpeer.ServeTrustlessGateway(t, content)
@@ -311,8 +305,7 @@ func TestGatewayMultiaddrConversion(t *testing.T) {
 	}
 }
 
-// The synthetic peer ID has to be stable, or a gateway would look like a new
-// peer on every node restart.
+// A gateway must not look like a new peer on every node restart.
 func TestGatewayPeerIDIsStableAndDistinct(t *testing.T) {
 	first, err := gatewayPeerID("https://ipfs.io")
 	if err != nil {

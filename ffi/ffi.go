@@ -24,11 +24,10 @@ type Config struct {
 	AllowUnverifiedGatewayFallback bool
 }
 
-// Client is a reusable handle over a running IPFS node. Bootstrap peers are
-// dialled on the first download and the connection is reused by later ones.
+// Client is a reusable handle over a running IPFS node.
 //
 // Bound to Android and iOS by gomobile, so the surface is limited to the types
-// it can carry: strings, sized integers and errors.
+// it can carry: strings, sized integers, booleans and errors.
 type Client struct {
 	inner *client.Client
 }
@@ -36,25 +35,21 @@ type Client struct {
 // NewClient builds a Client. bootstrapPeers is a ";" separated list of
 // multiaddrs. A port of 0 picks a free one.
 //
-// idleTimeout, in milliseconds, closes the underlying node once it has gone
-// that long without a download; the next download starts a new one. Zero or
-// negative disables it, leaving the node up until Close is called. Either way
-// Close must be called when the Client is no longer needed.
+// idleTimeout, in milliseconds, closes the node once it has gone that long
+// without a download; the next one starts a new node. Zero or negative keeps it
+// up until Close, which must be called either way.
 //
-// delegatedRouting is an optional delegated routing v1 endpoint, an IPNI indexer
-// such as "https://cid.contact", queried alongside the DHT. Empty disables it.
-// It finds content that is indexed but never announced to the DHT, which is how
-// large pinning services publish; the trade is that the endpoint learns which
-// CIDs are being fetched, so point it at one you run if that matters.
-// gateways is a ";" separated list of HTTP gateway URLs such as
-// "https://ipfs.io". They are fetched from alongside libp2p peers and what they
-// return is verified, so adding them costs nothing in trust.
+// delegatedRouting is a delegated routing v1 endpoint such as
+// "https://cid.contact", queried alongside the DHT. It finds content that is
+// indexed but never announced to the DHT; in exchange the endpoint learns which
+// CIDs are fetched. Empty disables it.
 //
-// allowUnverifiedGatewayFallback additionally permits a last-resort whole-file
-// fetch from those gateways once every verified route has failed. That content
-// CANNOT be checked against its CID and is trusted purely because the gateway
-// said so; it exists because some gateways serve files but not blocks, and a
-// caller may prefer unverified content to none.
+// gateways is a ";" separated list of HTTP gateway URLs, fetched from alongside
+// libp2p peers and verified like any other source.
+//
+// allowUnverifiedGatewayFallback permits a whole-file fetch from those gateways
+// once every verified route has failed. That content cannot be checked against
+// its CID and is trusted because the gateway served it.
 func NewClient(
 	bootstrapPeers string,
 	port int32,
@@ -78,9 +73,8 @@ func NewClient(
 	return &Client{inner: inner}, nil
 }
 
-// Get downloads cid to output. A sizeLimit above zero rejects larger content;
-// a timeout, in milliseconds, of zero or more bounds the call, and a negative
-// one lets it run until it finishes.
+// Get downloads cid to output. A sizeLimit above zero rejects larger content; a
+// timeout in milliseconds bounds the call, and a negative one does not.
 func (client *Client) Get(cid string, output string, sizeLimit int64, timeout int64) error {
 	ctx, cancel := withTimeout(timeout)
 	defer cancel()
@@ -93,9 +87,8 @@ func (client *Client) Close() error {
 	return client.inner.Close()
 }
 
-// Get downloads a single CID through a Client that is created and closed around
-// the call, re-dialling the bootstrap peers every time. Prefer NewClient when
-// fetching more than once.
+// Get downloads a single CID through a Client created and closed around the
+// call. Prefer NewClient when fetching more than once.
 func Get(cid string, output string, config *Config) error {
 	client, err := NewClient(
 		config.BootstrapPeers,

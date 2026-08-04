@@ -17,66 +17,41 @@ type Config struct {
 	BootstrapPeers []string
 	Port           int32
 
-	// IdleTimeout closes the underlying node once it has gone this long without
-	// a download, so an idle client stops holding connections open. Zero or
-	// negative disables it and leaves the node running until Close is called.
-	//
-	// Either way the node is restarted on demand, so a Client stays usable for
-	// as long as it is open.
+	// IdleTimeout closes the node once it has gone this long without a download;
+	// the next one starts a new node. Zero or negative keeps it up until Close.
 	IdleTimeout time.Duration
 
-	// DisableDHT turns off DHT provider lookups, leaving the node able to fetch
-	// only from the bootstrap peers it is directly connected to, plus whatever
-	// DelegatedRoutingEndpoint turns up. Rarely what you want outside of tests
-	// against a known peer.
+	// DisableDHT turns off DHT provider lookups, leaving only directly connected
+	// peers and whatever DelegatedRoutingEndpoint finds.
 	DisableDHT bool
 
-	// DelegatedRoutingEndpoint additionally resolves providers through a
-	// delegated routing v1 HTTP endpoint, an IPNI indexer such as
-	// "https://cid.contact". Empty disables it.
+	// DelegatedRoutingEndpoint resolves providers through a delegated routing v1
+	// endpoint such as "https://cid.contact", alongside the DHT. Empty disables it.
 	//
-	// Worth enabling because large pinning services publish to an indexer rather
-	// than announcing every CID to the DHT, so some content is findable only
-	// this way. Worth thinking about first because every lookup tells that
-	// endpoint which CID is being fetched, and by whom; the DHT spreads the same
-	// information over many peers instead of handing it to one party. Point it at
-	// an endpoint you run if that matters to you.
+	// Large pinning services publish to an indexer instead of announcing every CID
+	// to the DHT, so some content is findable no other way. In exchange the
+	// endpoint learns which CIDs are fetched, and by whom.
 	DelegatedRoutingEndpoint string
 
-	// Gateways are HTTP gateway URLs, for example "https://ipfs.io", fetched
-	// from alongside libp2p peers. Blocks they return are verified like any
-	// other, so this costs nothing in trust.
+	// Gateways are HTTP gateway URLs, for example "https://ipfs.io", fetched from
+	// alongside libp2p peers. What they return is verified like any other block.
 	Gateways []string
 
-	// AllowUnverifiedGatewayFallback permits a last-resort whole-file fetch from
-	// Gateways when every verified route has failed.
+	// AllowUnverifiedGatewayFallback permits a whole-file fetch from Gateways once
+	// every verified route has failed.
 	//
-	// Read that carefully before enabling it. A whole-file gateway response
-	// CANNOT be checked against its CID: the CID commits to a DAG - chunk size,
-	// leaf format, layout - none of which is recoverable from flat bytes, so
-	// identical content can legitimately carry different CIDs. Content arriving
-	// this way is trusted purely because the gateway said so, and a compromised
-	// or confused gateway can substitute anything.
-	//
-	// It exists because some gateways serve files but not blocks, and a caller
-	// may reasonably prefer unverified content to no content. Every other route
-	// in this package verifies.
+	// Such a response cannot be checked against its CID, which commits to a DAG
+	// rather than to bytes, so the content is trusted purely because the gateway
+	// served it. Enable it when unverified content still beats none.
 	AllowUnverifiedGatewayFallback bool
 }
 
-// Client is a reusable handle over an IPFS node. The node is started on the
-// first download and reused by later ones, so bootstrap peers are dialled once
-// rather than per fetch.
-//
-// A Client is safe for concurrent use. Close must be called to release it,
-// unless Config.IdleTimeout is set, in which case an unused node shuts itself
-// down and Close only needs to be called to retire the Client for good.
+// Client is a reusable handle over an IPFS node, started on the first download
+// and reused by later ones. Safe for concurrent use; Close releases it.
 type Client struct {
 	config nodeConfig
 	idle   time.Duration
 
-	// Retained as URLs for the unverified fallback, which talks plain HTTP and
-	// so needs no peer representation.
 	gateways        []string
 	allowUnverified bool
 
@@ -107,8 +82,6 @@ func New(config *Config) (*Client, error) {
 		gateways:   gateways,
 	}
 
-	// Built once and shared by every node this Client starts. Doing it here also
-	// rejects a malformed endpoint up front rather than at the first download.
 	if config.DelegatedRoutingEndpoint != "" {
 		delegated, err := newDelegatedRouter(config.DelegatedRoutingEndpoint)
 		if err != nil {
@@ -127,11 +100,11 @@ func New(config *Config) (*Client, error) {
 }
 
 // Get downloads cid to output, giving up when ctx is done. A sizeLimit above
-// zero rejects content larger than that many bytes before it is written.
+// zero rejects larger content before it is written.
 //
-// Content is fetched from libp2p peers and HTTP gateways together, verified
-// block by block. Only if that fails, and Config.AllowUnverifiedGatewayFallback
-// is set, does it fall back to an unverified whole-file gateway fetch.
+// Peers and gateways are fetched from together and verified block by block. Only
+// once that fails, and Config.AllowUnverifiedGatewayFallback is set, does it fall
+// back to an unverified whole-file gateway fetch.
 func (client *Client) Get(ctx context.Context, cid string, output string, sizeLimit int64) error {
 	verified, cancel := client.verifiedDeadline(ctx)
 	defer cancel()
@@ -147,8 +120,8 @@ func (client *Client) Get(ctx context.Context, cid string, output string, sizeLi
 		return err
 	}
 
-	// The caller's own deadline or cancellation ends it here. Only the internal
-	// verified-phase deadline above leaves budget to try anything else.
+	// Only the internal deadline above leaves budget for anything else; the
+	// caller's own deadline or cancellation ends it here.
 	if ctx.Err() != nil {
 		return contextError(ctx)
 	}
@@ -164,22 +137,17 @@ func (client *Client) Get(ctx context.Context, cid string, output string, sizeLi
 		return nil
 	}
 
-	// A size limit failure has to surface on its own. errors.Join concatenates
-	// messages, and the Kotlin wrapper selects SizeLimitExceededException by
-	// testing the message prefix, so joining it behind the verified failure would
-	// silently downgrade it to a plain IOException at the call site.
+	// The Kotlin wrapper selects SizeLimitExceededException on the message prefix,
+	// so this must not be buried behind the verified failure by errors.Join.
 	if errors.As(fallbackErr, &tooBig) {
 		return fallbackErr
 	}
 
-	// Otherwise both failures matter: the verified one says why the network could
-	// not serve it, the fallback one why the gateways could not either.
 	return errors.Join(err, fallbackErr)
 }
 
 // verifiedShare is how much of the caller's remaining time the verified routes
-// may use before the unverified fallback gets its turn. A verified route that
-// hangs must not spend the entire budget and leave nothing to fall back with.
+// may spend, so a hanging route still leaves budget to fall back with.
 const verifiedShare = 0.75
 
 func (client *Client) verifiedDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -189,7 +157,6 @@ func (client *Client) verifiedDeadline(ctx context.Context) (context.Context, co
 
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		// Nothing to divide: the verified path runs until it fails on its own.
 		return context.WithCancel(ctx)
 	}
 
@@ -201,15 +168,14 @@ func (client *Client) verifiedDeadline(ctx context.Context) (context.Context, co
 	return context.WithTimeout(ctx, time.Duration(float64(remaining)*verifiedShare))
 }
 
-// getVerified fetches over libp2p and HTTP block exchange, where every block is
-// checked against the CID that asked for it.
+// getVerified fetches over the block exchange, where every block is checked
+// against the CID that asked for it.
 func (client *Client) getVerified(ctx context.Context, cid string, output string, sizeLimit int64) error {
 	result := make(chan error, 1)
 
-	// Node startup runs under ctx as well: it dials bootstrap peers, which is
-	// often the slowest part of a cold fetch, and the caller's deadline has to
-	// cover it. The select below then guarantees a return at the deadline even
-	// if something further down stops honouring ctx.
+	// Started on its own goroutine so the select below returns at the deadline
+	// even if something further down stops honouring ctx. Node startup runs under
+	// ctx too: dialling peers is usually the slowest part of a cold fetch.
 	go func() {
 		node, err := client.acquire(ctx)
 		if err != nil {
@@ -223,10 +189,8 @@ func (client *Client) getVerified(ctx context.Context, cid string, output string
 
 	select {
 	case err := <-result:
-		// A failure that lands after the deadline has already passed is a
-		// timeout, whatever it reports internally. Checking ctx here also keeps
-		// the outcome deterministic: when the deadline expires both this case
-		// and the one below are ready, and select would otherwise pick at random.
+		// When the deadline expires both cases are ready and select would pick at
+		// random, so decide on ctx rather than on which channel won.
 		if err != nil && ctx.Err() != nil {
 			return contextError(ctx)
 		}
@@ -238,8 +202,7 @@ func (client *Client) getVerified(ctx context.Context, cid string, output string
 }
 
 // contextError maps a finished context onto the error the caller sees. The
-// Kotlin wrapper surfaces these messages directly, so a deadline has to keep
-// reporting as "timeout".
+// Kotlin wrapper surfaces these messages, so a deadline reports as "timeout".
 func contextError(ctx context.Context) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return utils.Timeout()
@@ -248,8 +211,8 @@ func contextError(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// Close shuts the node down and retires the Client. It is safe to call more
-// than once. Downloads still running are cancelled.
+// Close shuts the node down and retires the Client. Safe to call more than once.
+// Downloads still running are cancelled.
 func (client *Client) Close() error {
 	client.mutex.Lock()
 
@@ -266,9 +229,8 @@ func (client *Client) Close() error {
 
 	client.mutex.Unlock()
 
-	// Teardown blocks: host.Close waits on the host's background goroutines and
-	// bitswap's Close waits for its own shutdown. Neither may run under the
-	// mutex, or a concurrent Get would stall behind them with no way out.
+	// Teardown waits on libp2p and bitswap shutting down, so it must not hold the
+	// mutex: a concurrent Get would stall behind it with no way out.
 	if node != nil {
 		node.close()
 	}
@@ -296,8 +258,8 @@ func (client *Client) acquire(ctx context.Context) (*node, error) {
 		return node, nil
 	}
 
-	// Reserve the slot before unlocking so a concurrent Close or idle sweep sees
-	// the download and leaves the node alone.
+	// Claimed before unlocking, so a concurrent Close or idle sweep sees the
+	// download and leaves the node alone.
 	client.inflight++
 	client.mutex.Unlock()
 
@@ -311,14 +273,13 @@ func (client *Client) acquire(ctx context.Context) (*node, error) {
 
 	switch {
 	case client.closed:
-		// Closed while we were starting up: this node belongs to nobody.
 		client.mutex.Unlock()
 		node.close()
 		client.release()
 
 		return nil, ErrClosed
 	case client.node != nil:
-		// Another download won the race and started one first. Keep theirs.
+		// Another download started one first. Keep theirs.
 		existing := client.node
 		client.mutex.Unlock()
 		node.close()
@@ -332,8 +293,8 @@ func (client *Client) acquire(ctx context.Context) (*node, error) {
 	}
 }
 
-// release records that a download finished and arms the idle timer once the
-// node is no longer in use.
+// release records that a download finished and arms the idle timer once the node
+// is no longer in use.
 func (client *Client) release() {
 	client.mutex.Lock()
 	defer client.mutex.Unlock()
@@ -348,8 +309,6 @@ func (client *Client) release() {
 	client.timer = time.AfterFunc(client.idle, client.closeIdle)
 }
 
-// closeIdle shuts the node down after Config.IdleTimeout with no downloads. The
-// next Get simply starts a new one.
 func (client *Client) closeIdle() {
 	client.mutex.Lock()
 
@@ -375,9 +334,8 @@ func (client *Client) stopTimer() {
 	}
 }
 
-// Get downloads a single CID through a Client that is created and closed around
-// the call. It re-dials the bootstrap peers every time, so prefer building one
-// Client and reusing it when fetching more than once.
+// Get downloads a single CID through a Client created and closed around the call.
+// It re-dials the bootstrap peers every time, so prefer reusing one Client.
 func Get(ctx context.Context, cid string, output string, config *Config, sizeLimit int64) error {
 	client, err := New(config)
 	if err != nil {

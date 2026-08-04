@@ -11,8 +11,6 @@ func TestGetStringSlice(t *testing.T) {
 		input string
 		want  []string
 	}{
-		// strings.Split("", ";") returns [""], which reached connectToPeers as a
-		// single empty address and aborted the whole bootstrap list.
 		{"empty", "", []string{}},
 		{"whitespace only", "   ", []string{}},
 		{"single", "a", []string{"a"}},
@@ -40,7 +38,6 @@ func TestGetStringSliceCustomDelimiter(t *testing.T) {
 		t.Errorf("GetStringSlice = %#v, want %#v", got, want)
 	}
 
-	// The default delimiter must no longer apply once one is given.
 	if got := GetStringSlice("a;b", ","); !reflect.DeepEqual(got, []string{"a;b"}) {
 		t.Errorf("GetStringSlice = %#v, want the input left whole", got)
 	}

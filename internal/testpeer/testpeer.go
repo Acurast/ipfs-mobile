@@ -1,14 +1,9 @@
-// Package testpeer provides in-process IPFS peers for tests.
+// Package testpeer provides in-process IPFS peers for tests: real libp2p hosts
+// serving real UnixFS DAGs over a real exchange, with only the network hop local.
+// A mock would hide the libp2p, bitswap and routing behaviour these tests exist
+// to pin down.
 //
-// The peers here are real libp2p hosts serving real UnixFS DAGs over a real
-// bitswap exchange, with a real DHT; only the network hop is local. Substituting
-// a mock for the node would hide the behaviour these tests exist to pin down,
-// since the bugs this package was written for lived in the real libp2p, bitswap
-// and routing paths rather than in any logic of ours.
-//
-// It lives under internal/ so it can be shared by the client and ffi tests
-// without becoming part of the published surface, and it is imported only from
-// _test.go files, so it is never part of a gomobile bind.
+// Imported only from _test.go files, so it is never part of a gomobile bind.
 package testpeer
 
 import (
@@ -54,12 +49,10 @@ const DeadPeer = "/ip4/127.0.0.1/tcp/1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387
 const setupTimeout = 30 * time.Second
 
 // Serve starts a peer holding content and returns the multiaddr to bootstrap
-// from together with the root CID. Everything is torn down when the test ends.
+// from together with the root CID. Torn down when the test ends.
 //
-// The peer runs a DHT in server mode as well as a bitswap server. Clients under
-// test run a DHT in client mode and wait for their routing table to fill before
-// downloading, so without a DHT server to talk to every test would sit through
-// that wait.
+// It runs a DHT in server mode as well, since clients under test wait for their
+// routing table to fill and would otherwise sit through that wait every time.
 func Serve(t *testing.T, content []byte) (addr string, root string) {
 	t.Helper()
 
@@ -69,24 +62,16 @@ func Serve(t *testing.T, content []byte) (addr string, root string) {
 	return peerAddr(t, host), root
 }
 
-// ServeViaDHT starts two peers: a bootstrap node holding no content, and a
-// separate provider that holds the content and announces it to the DHT. The
-// returned address is the bootstrap node.
-//
-// A client given only that address cannot reach the content by direct
-// connection, because the node it connects to does not have it. The only route
-// is a DHT provider lookup, which is what makes this a test of content routing
-// rather than of bitswap alone.
+// ServeViaDHT starts a bootstrap node holding no content and a provider that
+// holds it and announces it to the DHT. The returned address is the bootstrap
+// node, so the only route to the content is a provider lookup.
 func ServeViaDHT(t *testing.T, content []byte) (bootstrapAddr string, root string) {
 	t.Helper()
 
 	ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
 	defer cancel()
 
-	// Knows every peer, holds no blocks.
 	bootstrapHost, _ := startPeer(t)
-
-	// Holds the blocks, reachable only once discovered.
 	providerHost, providerDHT := startPeer(t)
 	root = serveContent(t, providerHost, content)
 
@@ -99,7 +84,6 @@ func ServeViaDHT(t *testing.T, content []byte) (bootstrapAddr string, root strin
 	}
 	waitForRoutingTable(t, providerDHT)
 
-	// Publishes a provider record for root, which is what the client will look up.
 	parsed, err := cid.Parse(root)
 	if err != nil {
 		t.Fatal(err)
@@ -111,14 +95,10 @@ func ServeViaDHT(t *testing.T, content []byte) (bootstrapAddr string, root strin
 	return peerAddr(t, bootstrapHost), root
 }
 
-// ServeIsolated starts two peers: a bootstrap node holding no content, and a
-// provider that holds it but announces it nowhere at all - no DHT record, no
-// index entry. Returns both addresses and the root CID.
-//
-// A client given only the bootstrap address cannot reach the content by any
-// means of its own; something has to tell it where the provider is. That is what
-// makes this the right fixture for testing delegated routing, and the control
-// for testing that no routing means no retrieval.
+// ServeIsolated starts a bootstrap node holding no content and a provider that
+// holds it but announces it nowhere. A client given only the bootstrap address
+// cannot reach it unaided, which is what makes this the fixture for delegated
+// routing and the control for having no routing at all.
 func ServeIsolated(t *testing.T, content []byte) (bootstrapAddr string, providerAddr string, root string) {
 	t.Helper()
 
@@ -130,12 +110,9 @@ func ServeIsolated(t *testing.T, content []byte) (bootstrapAddr string, provider
 	return peerAddr(t, bootstrapHost), peerAddr(t, providerHost), root
 }
 
-// ServeTrustlessGateway starts an HTTP gateway that answers the block requests a
-// verified fetch makes: GET /ipfs/<cid>?format=raw with Accept
-// application/vnd.ipld.raw, returning that single block's bytes.
-//
-// It reports how many block requests it served, so a test can prove retrieval
-// actually went through the gateway rather than somewhere else.
+// ServeTrustlessGateway starts an HTTP gateway answering the block requests a
+// verified fetch makes, and counts them so a test can prove retrieval went
+// through the gateway.
 func ServeTrustlessGateway(t *testing.T, content []byte) (gatewayURL string, root string, blockRequests *atomic.Int32) {
 	t.Helper()
 
@@ -153,10 +130,9 @@ func ServeTrustlessGateway(t *testing.T, content []byte) (gatewayURL string, roo
 			return
 		}
 
-		// httpnet probes an endpoint for liveness with bafkqaaa, the identity
-		// CID, before it will use it. An identity CID inlines its own content, so
-		// a real gateway answers from the multihash without any lookup; without
-		// this the probe 404s and the gateway is never used at all.
+		// httpnet probes for liveness with the identity CID before using an
+		// endpoint. Identity CIDs inline their content, so answer from the
+		// multihash; a 404 here means the gateway is never used at all.
 		if decoded, err := multihash.Decode(parsed.Hash()); err == nil && decoded.Code == multihash.IDENTITY {
 			w.Header().Set("Content-Type", "application/vnd.ipld.raw")
 			w.Write(decoded.Digest)
@@ -169,7 +145,6 @@ func ServeTrustlessGateway(t *testing.T, content []byte) (gatewayURL string, roo
 			return
 		}
 
-		// Only a raw block request counts; anything else is a different protocol.
 		if r.URL.Query().Get("format") == "raw" || strings.Contains(r.Header.Get("Accept"), "application/vnd.ipld.raw") {
 			blockRequests.Add(1)
 			w.Header().Set("Content-Type", "application/vnd.ipld.raw")
@@ -187,11 +162,8 @@ func ServeTrustlessGateway(t *testing.T, content []byte) (gatewayURL string, roo
 }
 
 // ServeWholeFileGateway starts an HTTP gateway that serves complete files and
-// refuses block requests, the way a gateway without trustless support behaves.
-//
-// Retrieval through it cannot be verified, which is exactly what makes it the
-// fixture for the unverified fallback. servedBody lets a test hand back content
-// that does not match the CID, to check what the client does with it.
+// refuses block requests, as a gateway without trustless support does. servedBody
+// may deliberately not match the CID.
 func ServeWholeFileGateway(t *testing.T, root string, servedBody []byte) (gatewayURL string, requests *atomic.Int32) {
 	t.Helper()
 
@@ -221,11 +193,8 @@ func ServeWholeFileGateway(t *testing.T, root string, servedBody []byte) (gatewa
 }
 
 // Stalled returns the multiaddr of a listener that accepts TCP connections and
-// then says nothing, so libp2p completes the dial and hangs in its security
-// handshake until the caller's deadline expires.
-//
-// A refused connection fails in microseconds, which is useless for testing that
-// node startup runs under the deadline; this stalls instead.
+// then says nothing, so libp2p hangs in its security handshake until the
+// caller's deadline expires. A refused connection fails too fast to be useful.
 func Stalled(t *testing.T) string {
 	t.Helper()
 
@@ -244,13 +213,13 @@ func Stalled(t *testing.T) string {
 				return
 			}
 
-			// Hold the connection open without ever writing to it.
+			// Held open, never written to.
 			accepted <- conn
 		}
 	}()
 
-	// One cleanup, in this order: closing the listener is what ends the accept
-	// loop and closes the channel, so draining first would wait forever.
+	// One cleanup, in this order: closing the listener ends the accept loop and
+	// closes the channel, so draining first would wait forever.
 	t.Cleanup(func() {
 		listener.Close()
 
@@ -373,9 +342,7 @@ func addUnixfsFile(t *testing.T, store blockstore.Blockstore, content []byte) ci
 		Dagserv:    dserv,
 	}
 
-	// A small chunk size so even modest fixtures produce a multi-block DAG, which
-	// exercises the session and block-fetch paths rather than a single inlined
-	// block.
+	// A small chunk size so even modest fixtures produce a multi-block DAG.
 	builder, err := params.New(chunker.NewSizeSplitter(bytes.NewReader(content), 1024))
 	if err != nil {
 		t.Fatalf("building dag: %v", err)

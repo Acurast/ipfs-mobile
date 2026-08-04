@@ -33,15 +33,13 @@ import (
 )
 
 const (
-	// Upper bound on waiting for the DHT routing table to become usable. A cold
-	// start against real bootstrap peers normally fills it well inside this.
+	// Upper bound on waiting for a usable DHT routing table.
 	dhtReadyTimeout = 5 * time.Second
 	dhtReadyPoll    = 50 * time.Millisecond
 )
 
-// node is a running libp2p host with a bitswap client attached, and a DHT to
-// find providers with. It is owned by exactly one Client, which is the only
-// thing allowed to close it.
+// node is a running libp2p host with a block exchange and a DHT, owned by
+// exactly one Client.
 type node struct {
 	cancel context.CancelFunc
 	host   host.Host
@@ -50,25 +48,20 @@ type node struct {
 	bs     *bsclient.Client
 }
 
-// nodeConfig is everything a node needs to start. It is built once, when the
-// Client is created, and reused every time the node is restarted.
+// nodeConfig is everything a node needs to start.
 type nodeConfig struct {
 	port       int32
 	peers      []peer.AddrInfo
 	disableDHT bool
 
-	// gateways are fetched from over HTTP as ordinary peers, not as a fallback:
-	// blocks they return are verified like any other, and they are asked at the
-	// same time as libp2p peers rather than after those give up.
-	gateways []peer.AddrInfo
-
-	// delegated is nil unless a delegated routing endpoint was configured.
+	// gateways are asked at the same time as libp2p peers, not after them.
+	gateways  []peer.AddrInfo
 	delegated routing.ContentDiscovery
 }
 
-// startNode brings up a host and connects it to the bootstrap peers. It blocks
-// until the first peer is reachable, bounded by ctx: bitswap has nothing to ask
-// until it has a connection, so failing here beats letting the download hang.
+// startNode brings up a host and blocks until it has somewhere to fetch from,
+// bounded by ctx. Failing here beats letting the download hang on a node with no
+// connections.
 func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	host, err := makeHost(config.port)
 	if err != nil {
@@ -80,17 +73,11 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 
 	node := &node{cancel: cancel, host: host}
 
-	// Without any provider finder bitswap has no content routing at all, and can
-	// only fetch from peers it happens to be directly connected to.
 	var kadFinder routing.ContentDiscovery
 
 	if !config.disableDHT {
-		// Client mode: query the DHT without answering queries for it. A phone is
-		// usually behind NAT and on a metered, battery powered connection, so it
-		// makes a poor DHT server.
-		//
-		// No context here: the DHT's lifetime is bounded by its own Close, which
-		// node.close calls.
+		// Client mode: a phone behind NAT on a metered connection makes a poor DHT
+		// server, so query without answering.
 		kad, err := dht.New(host, dht.Mode(dht.ModeClient), dht.BootstrapPeers(config.peers...))
 		if err != nil {
 			node.close()
@@ -101,8 +88,7 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 		kadFinder = kad
 	}
 
-	// One exchange over two transports. The router sends a want to whichever of
-	// the two a given peer speaks, so an HTTP gateway and a libp2p peer are both
+	// One exchange over two transports, so a gateway and a libp2p peer are both
 	// just peers that might have the block.
 	node.http = httpnet.New(host, httpnet.WithUserAgent(userAgent))
 	exchange := network.New(host.Peerstore(), bsnet.NewFromIpfsHost(host), node.http)
@@ -115,9 +101,8 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	)
 	exchange.Start(node.bs)
 
-	// Gateways are dialled first and do not count towards needing a libp2p peer:
-	// a reachable gateway alone is enough to retrieve content, which is the whole
-	// point of having them.
+	// A reachable gateway alone is enough to retrieve content, so having one
+	// excuses failing to reach any libp2p peer.
 	gateways := connectToGateways(ctx, node.http, config.gateways)
 
 	if err := connectToPeers(ctx, host, config.peers); err != nil {
@@ -126,7 +111,6 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 			return nil, err
 		}
 
-		// Some content is served only over HTTP anyway, so carry on.
 		fmt.Printf("continuing with %d gateway(s) despite: %s\n", gateways, err)
 	}
 
@@ -137,13 +121,10 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	return node, nil
 }
 
-// bootstrapDHT populates the routing table and waits, briefly, for it to hold at
-// least one peer. A provider lookup against an empty table finds nothing, so
-// starting the download before then spends the caller's deadline on a query that
-// cannot yet succeed.
-//
-// Failing to get a usable table is never fatal: directly connected peers may
-// still hold the content, and the table keeps filling while the download runs.
+// bootstrapDHT waits briefly for the routing table to hold a peer, since a
+// lookup against an empty one finds nothing and spends the caller's deadline
+// doing it. Never fatal: connected peers may hold the content anyway, and the
+// table keeps filling during the download.
 func (node *node) bootstrapDHT(ctx context.Context) {
 	if err := node.dht.Bootstrap(ctx); err != nil {
 		fmt.Printf("failed to bootstrap the dht: %s\n", err)
@@ -167,8 +148,6 @@ func (node *node) bootstrapDHT(ctx context.Context) {
 }
 
 func (node *node) download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
-	// cid.MustParse panics on a malformed CID, which would take the process down
-	// rather than surfacing as an error to the caller.
 	parsed, err := cid.Parse(cidStr)
 	if err != nil {
 		return fmt.Errorf("invalid cid %q: %w", cidStr, err)
@@ -199,10 +178,8 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 		}
 	}
 
-	// A download that hits its deadline is abandoned part way through the write,
-	// so stage it next to the target and move it into place only once complete.
-	// Otherwise a timed out call leaves a truncated file at output, and a retry
-	// races the abandoned write for the same path.
+	// Staged and renamed, so a download abandoned at its deadline leaves no
+	// truncated file at output and does not race a retry writing the same path.
 	scratch, err := os.MkdirTemp(filepath.Dir(output), ".ipfs-download-")
 	if err != nil {
 		return err
@@ -221,8 +198,7 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 	return os.Rename(staged, output)
 }
 
-// close tolerates a partially built node, since startNode calls it to unwind a
-// failed start.
+// close tolerates a partially built node, which is how startNode unwinds.
 func (node *node) close() {
 	node.cancel()
 
@@ -240,8 +216,8 @@ func (node *node) close() {
 }
 
 func makeHost(port int32) (host.Host, error) {
-	// Ed25519 rather than RSA-2048: the identity is ephemeral, and RSA key
-	// generation costs seconds on mobile ARM cores with a long tail.
+	// Ed25519 because the identity is ephemeral and RSA keygen costs seconds on
+	// mobile ARM cores.
 	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
 	if err != nil {
 		return nil, err
@@ -255,9 +231,9 @@ func makeHost(port int32) (host.Host, error) {
 	return libp2p.New(opts...)
 }
 
-// parsePeers validates bootstrap addresses up front so a bad list fails when the
-// Client is built, rather than producing a node with nobody to talk to. Invalid
-// entries are skipped; only an entirely unusable list is an error.
+// parsePeers validates bootstrap addresses when the Client is built rather than
+// at the first download. Invalid entries are skipped; only an entirely unusable
+// list is an error.
 func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 	infos := make(map[peer.ID]*peer.AddrInfo, len(addrs))
 	order := make([]peer.ID, 0, len(addrs))
@@ -293,7 +269,7 @@ func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 		return nil, fmt.Errorf("none of the %d configured bootstrap peers is a valid address", len(addrs))
 	}
 
-	// Keep the configured order rather than the map's, so behaviour is stable.
+	// Configured order rather than the map's, so behaviour is stable.
 	peers := make([]peer.AddrInfo, 0, len(order))
 	for _, id := range order {
 		peers = append(peers, *infos[id])
@@ -302,12 +278,9 @@ func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 	return peers, nil
 }
 
-// connectToGateways registers each gateway with the HTTP exchange and reports
-// how many answered. httpnet probes the URL rather than performing a libp2p
-// handshake, so "connecting" here just means the endpoint responded.
-//
-// Failures are logged, never fatal: gateways supplement the libp2p peers and an
-// unreachable one should cost nothing but the dial.
+// connectToGateways registers each gateway and reports how many answered.
+// Connecting means the endpoint responded to a probe, not that a libp2p
+// handshake completed. Unreachable gateways are logged, never fatal.
 func connectToGateways(ctx context.Context, exchange network.BitSwapNetwork, gateways []peer.AddrInfo) int {
 	if len(gateways) == 0 {
 		return 0
@@ -338,8 +311,8 @@ func connectToGateways(ctx context.Context, exchange network.BitSwapNetwork, gat
 	return int(connected.Load())
 }
 
-// gatewayName renders a gateway for logs. Its peer ID is a synthetic derived
-// from the URL, so printing that instead would be noise.
+// gatewayName renders a gateway for logs, where its synthetic peer ID would be
+// noise.
 func gatewayName(gateway peer.AddrInfo) string {
 	if len(gateway.Addrs) == 0 {
 		return gateway.ID.String()
@@ -348,9 +321,8 @@ func gatewayName(gateway peer.AddrInfo) string {
 	return gateway.Addrs[0].String()
 }
 
-// connectToPeers dials every peer in parallel and returns as soon as one of them
-// answers. The rest keep dialling in the background: more peers is strictly
-// better for bitswap, but waiting for the slowest one is not.
+// connectToPeers dials every peer in parallel and returns once one answers. The
+// rest keep dialling in the background rather than holding up the caller.
 func connectToPeers(ctx context.Context, host host.Host, peers []peer.AddrInfo) error {
 	if len(peers) == 0 {
 		return fmt.Errorf("no bootstrap peers configured, there is nobody to fetch blocks from")

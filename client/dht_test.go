@@ -11,11 +11,8 @@ import (
 	"ipfs-mobile/internal/testpeer"
 )
 
-// The point of the DHT: the client bootstraps to a node that holds no content
-// and still fetches, by looking up who provides the CID.
-//
-// Without content routing this cannot work at all, which is what the disabled
-// case below asserts.
+// The client bootstraps to a node holding no content and still fetches, by
+// looking up who provides the CID.
 func TestDHTFindsContentOnAnUnconnectedProvider(t *testing.T) {
 	content := testpeer.Content(4096)
 	bootstrapAddr, root := testpeer.ServeViaDHT(t, content)
@@ -39,9 +36,7 @@ func TestDHTFindsContentOnAnUnconnectedProvider(t *testing.T) {
 	}
 }
 
-// The mirror image, and the reason the DHT was added: with content routing off,
-// the same fetch cannot succeed, because the only connected peer does not hold
-// the blocks and there is no way to discover the one that does.
+// The control for the test above.
 func TestWithoutDHTContentOnAnUnconnectedProviderIsUnreachable(t *testing.T) {
 	content := testpeer.Content(4096)
 	bootstrapAddr, root := testpeer.ServeViaDHT(t, content)
@@ -63,8 +58,6 @@ func TestWithoutDHTContentOnAnUnconnectedProviderIsUnreachable(t *testing.T) {
 	}
 }
 
-// A node with the DHT enabled should end up with a usable routing table before
-// the download starts, so the first provider lookup has somewhere to ask.
 func TestDHTRoutingTableIsReadyBeforeDownloading(t *testing.T) {
 	addr, root := testpeer.Serve(t, testpeer.Content(1024))
 
@@ -116,7 +109,6 @@ func TestDisableDHTLeavesNoDHTRunning(t *testing.T) {
 	}
 }
 
-// Starting and stopping the node repeatedly must not leak or wedge the DHT.
 func TestDHTSurvivesNodeRestart(t *testing.T) {
 	content := testpeer.Content(1024)
 	addr, root := testpeer.Serve(t, content)

@@ -1,10 +1,6 @@
-# CI toolchain for ipfs-mobile.
-#
-# Carries Go for the test suite plus the Android SDK, NDK and a JDK, because the
-# gomobile bind and the Kotlin wrapper are verified here too. That is not
-# optional extra weight: the bind links code the Go tests never touch, and has
-# already broken once on its own (a //go:linkname in a libp2p dependency that the
-# Go 1.23+ linker rejects) while every test stayed green.
+# CI toolchain: Go for the test suite, plus the Android SDK, NDK and a JDK,
+# because the gomobile bind links code the Go tests never touch and has to be
+# verified separately.
 FROM golang:1.25-bookworm
 
 ### Prepare environment ###
@@ -19,8 +15,7 @@ RUN apt-get update -qq && \
 
 ### Install Android SDK ###
 
-# Keep in step with jitpack.yml, which builds the published artifact, and with
-# android/app/build.gradle.kts.
+# Keep in step with jitpack.yml and android/app/build.gradle.kts.
 ENV NDK_VERSION=29.0.14206865
 ENV ANDROID_HOME=/usr/lib/android-sdk
 ENV ANDROID_COMPILE_SDK=34
@@ -38,8 +33,8 @@ ENV PATH="$PATH:${ANDROID_HOME}/cmdline-tools/latest/bin:${ANDROID_HOME}/platfor
 
 RUN yes | sdkmanager --sdk_root="${ANDROID_HOME}" --licenses
 
-# Installed explicitly rather than left to Gradle's on-demand download, so the
-# image is self-contained and a build cannot fail on a Google endpoint.
+# Explicit rather than left to Gradle's on-demand download, so a build cannot
+# fail on a Google endpoint.
 RUN sdkmanager --sdk_root="${ANDROID_HOME}" \
         "platform-tools" \
         "platforms;android-${ANDROID_COMPILE_SDK}" \
@@ -51,8 +46,7 @@ ENV ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}
 
 ### Install Go tooling ###
 
-# gomobile produces the .aar. go-junit-report turns `go test` output into the
-# JUnit XML GitLab renders in the pipeline and merge request UI.
+# go-junit-report turns `go test` output into the JUnit XML GitLab renders.
 RUN go install golang.org/x/mobile/cmd/gomobile@latest && \
     go install github.com/jstemmer/go-junit-report/v2@latest && \
     gomobile init
@@ -61,12 +55,11 @@ RUN go install golang.org/x/mobile/cmd/gomobile@latest && \
 
 WORKDIR /app
 
-# Dependencies before sources, so editing a .go file does not invalidate the
-# module download layer.
+# Dependencies before sources, so editing a .go file keeps the download layer.
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Same idea for the Gradle distribution, which the wrapper fetches on first use.
+# Same for the Gradle distribution, which the wrapper fetches on first use.
 COPY android/gradle ./android/gradle
 COPY android/gradlew ./android/gradlew
 RUN chmod +x android/gradlew && (cd android && ./gradlew --version > /dev/null)

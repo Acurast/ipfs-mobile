@@ -17,8 +17,11 @@ prepare:
 
 ### Test ###
 
-# Every job runs its command in a fresh container off the prepared image, then
-# copies results out before the container is removed.
+# Each job runs in a fresh container off the prepared image.
+#
+# bash, not sh: the image is Debian, where /bin/sh is dash and `set -o pipefail`
+# is unavailable. Without it a failing `go test` would be masked by the exit
+# status of the report generator at the end of the pipe.
 .test:base:
   stage: test
   interruptible: true
@@ -56,8 +59,6 @@ unit:
   variables:
     CONTAINER_TAG: go-unit-$CI_COMMIT_SHA
   script:
-    # -race because this package is almost entirely concurrency; a data race here
-    # is the failure mode, not an edge case.
     - |
       docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
         set -eo pipefail
@@ -66,16 +67,13 @@ unit:
           | tee test.log \
           | go-junit-report -set-exit-code > report.xml
 
-        # internal/testpeer is test-support code, driven entirely by the client
-        # and ffi suites. Go only credits a package for coverage from its own
-        # tests, so leaving it in reports it as 0% and drags the headline number
-        # from 90% down to 66%, which says nothing true about the code that ships.
+        # internal/testpeer is test-support code. Go only credits a package for
+        # coverage from its own tests, so counting it reports 0% for code that is
+        # exercised constantly and understates the rest.
         grep -v "ipfs-mobile/internal/" coverage.out > coverage.prod.out
         go tool cover -func=coverage.prod.out | tail -1
       '
-  # In after_script, so a failing run still yields its report and log - which is
-  # when they are most useful. Putting these in script: meant a test failure
-  # skipped straight to container removal and the evidence went with it.
+  # In after_script, so a failing run still yields its report and log.
   after_script:
     - mkdir -p reports
     - docker cp $CONTAINER_TAG:/app/report.xml reports/report.xml || true
@@ -91,12 +89,9 @@ unit:
     reports:
       junit: reports/report.xml
 
-# Live tests against the public IPFS network, behind the integration build tag.
-#
-# allow_failure because the assertions depend on third party infrastructure:
-# public bootstrap peers, DHT provider records and the cid.contact indexer. A
-# failure here is worth seeing but is as likely to mean "the network had a bad
-# day" as "this commit broke something", and that should not block a merge.
+# Live tests against the public IPFS network. allow_failure because they depend
+# on third party infrastructure, so a failure is as likely to mean the network
+# had a bad day as that this commit broke something.
 integration:
   extends: .test:base
   variables:
@@ -127,11 +122,9 @@ integration:
 
 ### Build ###
 
-# The gomobile bind and the Kotlin wrapper, which is what actually ships.
-#
-# Deliberately not optional: the bind links transports and dependencies the Go
-# tests never exercise, and has broken on its own before while the whole test
-# suite stayed green. Nothing else in this pipeline would catch that.
+# The gomobile bind and the Kotlin wrapper, which is what actually ships. Not
+# optional: the bind links transports the Go tests never exercise, and nothing
+# else here would catch it breaking.
 android:
   stage: build
   interruptible: true
