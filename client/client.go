@@ -25,6 +25,12 @@ type Config struct {
 	// Either way the node is restarted on demand, so a Client stays usable for
 	// as long as it is open.
 	IdleTimeout time.Duration
+
+	// DisableDHT turns off provider lookups, leaving the node able to fetch only
+	// from the bootstrap peers it is directly connected to. Those peers do not
+	// generally hold arbitrary content, so this is rarely what you want outside
+	// of tests against a known peer.
+	DisableDHT bool
 }
 
 // Client is a reusable handle over an IPFS node. The node is started on the
@@ -35,9 +41,10 @@ type Config struct {
 // unless Config.IdleTimeout is set, in which case an unused node shuts itself
 // down and Close only needs to be called to retire the Client for good.
 type Client struct {
-	port  int32
-	peers []peer.AddrInfo
-	idle  time.Duration
+	port       int32
+	peers      []peer.AddrInfo
+	idle       time.Duration
+	disableDHT bool
 
 	mutex    sync.Mutex
 	node     *node
@@ -54,7 +61,12 @@ func New(config *Config) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{port: config.Port, peers: peers, idle: config.IdleTimeout}, nil
+	return &Client{
+		port:       config.Port,
+		peers:      peers,
+		idle:       config.IdleTimeout,
+		disableDHT: config.DisableDHT,
+	}, nil
 }
 
 // Get downloads cid to output, giving up when ctx is done. A sizeLimit above
@@ -157,7 +169,7 @@ func (client *Client) acquire(ctx context.Context) (*node, error) {
 	client.inflight++
 	client.mutex.Unlock()
 
-	node, err := startNode(ctx, client.port, client.peers)
+	node, err := startNode(ctx, client.port, client.peers, client.disableDHT)
 	if err != nil {
 		client.release()
 		return nil, err

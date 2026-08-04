@@ -1,10 +1,10 @@
 // Package testpeer provides in-process IPFS peers for tests.
 //
 // The peers here are real libp2p hosts serving real UnixFS DAGs over a real
-// bitswap exchange; only the network hop is local. Substituting a mock for the
-// node would hide the behaviour these tests exist to pin down, since the bugs
-// this package was written for lived in the real libp2p and bitswap shutdown
-// and dial paths rather than in any logic of ours.
+// bitswap exchange, with a real DHT; only the network hop is local. Substituting
+// a mock for the node would hide the behaviour these tests exist to pin down,
+// since the bugs this package was written for lived in the real libp2p, bitswap
+// and routing paths rather than in any logic of ours.
 //
 // It lives under internal/ so it can be shared by the client and ffi tests
 // without becoming part of the published surface, and it is imported only from
@@ -17,9 +17,10 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/ipfs/boxo/bitswap"
-	bsnet "github.com/ipfs/boxo/bitswap/network"
+	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	"github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/blockstore"
 	chunker "github.com/ipfs/boxo/chunker"
@@ -31,8 +32,9 @@ import (
 	"github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
 	"github.com/libp2p/go-libp2p"
-	routinghelpers "github.com/libp2p/go-libp2p-routing-helpers"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 )
 
@@ -44,42 +46,64 @@ const UnreachableCID = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fb
 // refused immediately.
 const DeadPeer = "/ip4/127.0.0.1/tcp/1/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
 
-// Serve starts a bitswap server holding content and returns the multiaddr to
-// bootstrap from together with the root CID. Everything is torn down when the
-// test finishes.
+const setupTimeout = 30 * time.Second
+
+// Serve starts a peer holding content and returns the multiaddr to bootstrap
+// from together with the root CID. Everything is torn down when the test ends.
+//
+// The peer runs a DHT in server mode as well as a bitswap server. Clients under
+// test run a DHT in client mode and wait for their routing table to fill before
+// downloading, so without a DHT server to talk to every test would sit through
+// that wait.
 func Serve(t *testing.T, content []byte) (addr string, root string) {
 	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
+	host, _ := startPeer(t)
+	root = serveContent(t, host, content)
 
-	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	return peerAddr(t, host), root
+}
+
+// ServeViaDHT starts two peers: a bootstrap node holding no content, and a
+// separate provider that holds the content and announces it to the DHT. The
+// returned address is the bootstrap node.
+//
+// A client given only that address cannot reach the content by direct
+// connection, because the node it connects to does not have it. The only route
+// is a DHT provider lookup, which is what makes this a test of content routing
+// rather than of bitswap alone.
+func ServeViaDHT(t *testing.T, content []byte) (bootstrapAddr string, root string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), setupTimeout)
+	defer cancel()
+
+	// Knows every peer, holds no blocks.
+	bootstrapHost, _ := startPeer(t)
+
+	// Holds the blocks, reachable only once discovered.
+	providerHost, providerDHT := startPeer(t)
+	root = serveContent(t, providerHost, content)
+
+	if err := providerHost.Connect(ctx, *host.InfoFromHost(bootstrapHost)); err != nil {
+		t.Fatalf("joining the provider to the bootstrap node: %v", err)
+	}
+
+	if err := providerDHT.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrapping the provider dht: %v", err)
+	}
+	waitForRoutingTable(t, providerDHT)
+
+	// Publishes a provider record for root, which is what the client will look up.
+	parsed, err := cid.Parse(root)
 	if err != nil {
-		t.Fatalf("generating peer identity: %v", err)
+		t.Fatal(err)
+	}
+	if err := providerDHT.Provide(ctx, parsed, true); err != nil {
+		t.Fatalf("announcing content to the dht: %v", err)
 	}
 
-	host, err := libp2p.New(
-		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
-		libp2p.Identity(priv),
-	)
-	if err != nil {
-		t.Fatalf("starting peer host: %v", err)
-	}
-	t.Cleanup(func() { host.Close() })
-
-	store := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
-	rootCid := addUnixfsFile(t, store, content)
-
-	network := bsnet.NewFromIpfsHost(host, routinghelpers.Null{})
-	server := bitswap.New(ctx, network, store)
-	t.Cleanup(func() { server.Close() })
-
-	addrs := host.Addrs()
-	if len(addrs) == 0 {
-		t.Fatal("peer host is not listening on any address")
-	}
-
-	return fmt.Sprintf("%s/p2p/%s", addrs[0], host.ID()), rootCid.String()
+	return peerAddr(t, bootstrapHost), root
 }
 
 // Stalled returns the multiaddr of a listener that accepts TCP connections and
@@ -144,6 +168,77 @@ func Content(size int) []byte {
 	}
 
 	return content
+}
+
+// startPeer brings up a host with a DHT in server mode, so peers under test can
+// both discover through it and populate a routing table from it.
+func startPeer(t *testing.T) (host.Host, *dht.IpfsDHT) {
+	t.Helper()
+
+	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	if err != nil {
+		t.Fatalf("generating peer identity: %v", err)
+	}
+
+	peerHost, err := libp2p.New(
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+		libp2p.Identity(priv),
+	)
+	if err != nil {
+		t.Fatalf("starting peer host: %v", err)
+	}
+	t.Cleanup(func() { peerHost.Close() })
+
+	kad, err := dht.New(peerHost, dht.Mode(dht.ModeServer))
+	if err != nil {
+		peerHost.Close()
+		t.Fatalf("starting peer dht: %v", err)
+	}
+	t.Cleanup(func() { kad.Close() })
+
+	return peerHost, kad
+}
+
+// serveContent attaches a bitswap server backed by a blockstore holding content,
+// and returns its root CID.
+func serveContent(t *testing.T, peerHost host.Host, content []byte) string {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	store := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	root := addUnixfsFile(t, store, content)
+
+	network := bsnet.NewFromIpfsHost(peerHost)
+	server := bitswap.New(ctx, network, nil, store)
+	t.Cleanup(func() { server.Close() })
+
+	return root.String()
+}
+
+func peerAddr(t *testing.T, peerHost host.Host) string {
+	t.Helper()
+
+	addrs := peerHost.Addrs()
+	if len(addrs) == 0 {
+		t.Fatal("peer host is not listening on any address")
+	}
+
+	return fmt.Sprintf("%s/p2p/%s", addrs[0], peerHost.ID())
+}
+
+func waitForRoutingTable(t *testing.T, kad *dht.IpfsDHT) {
+	t.Helper()
+
+	deadline := time.Now().Add(setupTimeout)
+	for kad.RoutingTable().Size() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("dht routing table never filled")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 // addUnixfsFile writes content into store as a UnixFS DAG and returns its root.

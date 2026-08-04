@@ -7,20 +7,22 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 
 	"github.com/libp2p/go-libp2p"
-	routinghelpers "github.com/libp2p/go-libp2p-routing-helpers"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
 
 	"github.com/multiformats/go-multiaddr"
 
 	bsclient "github.com/ipfs/boxo/bitswap/client"
-	bsnet "github.com/ipfs/boxo/bitswap/network"
+	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	"github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/files"
@@ -28,18 +30,27 @@ import (
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 )
 
-// node is a running libp2p host with a bitswap client attached. It is owned by
-// exactly one Client, which is the only thing allowed to close it.
+const (
+	// Upper bound on waiting for the DHT routing table to become usable. A cold
+	// start against real bootstrap peers normally fills it well inside this.
+	dhtReadyTimeout = 5 * time.Second
+	dhtReadyPoll    = 50 * time.Millisecond
+)
+
+// node is a running libp2p host with a bitswap client attached, and a DHT to
+// find providers with. It is owned by exactly one Client, which is the only
+// thing allowed to close it.
 type node struct {
 	cancel context.CancelFunc
 	host   host.Host
+	dht    *dht.IpfsDHT
 	bs     *bsclient.Client
 }
 
 // startNode brings up a host and connects it to the bootstrap peers. It blocks
 // until the first peer is reachable, bounded by ctx: bitswap has nothing to ask
 // until it has a connection, so failing here beats letting the download hang.
-func startNode(ctx context.Context, port int32, peers []peer.AddrInfo) (*node, error) {
+func startNode(ctx context.Context, port int32, peers []peer.AddrInfo, disableDHT bool) (*node, error) {
 	host, err := makeHost(port)
 	if err != nil {
 		return nil, err
@@ -48,18 +59,72 @@ func startNode(ctx context.Context, port int32, peers []peer.AddrInfo) (*node, e
 	// The node outlives any single request, so its lifetime is not tied to ctx.
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
-	network := bsnet.NewFromIpfsHost(host, routinghelpers.Null{})
-	bs := bsclient.New(nodeCtx, network, blockstore.NewBlockstore(datastore.NewNullDatastore()))
-	network.Start(bs)
+	node := &node{cancel: cancel, host: host}
 
-	node := &node{cancel: cancel, host: host, bs: bs}
+	// Without a provider finder bitswap has no content routing at all, and can
+	// only fetch from peers it happens to be directly connected to. The DHT is
+	// what lets it find whoever actually holds a CID.
+	var providerFinder routing.ContentDiscovery
+
+	if !disableDHT {
+		// Client mode: query the DHT without answering queries for it. A phone is
+		// usually behind NAT and on a metered, battery powered connection, so it
+		// makes a poor DHT server.
+		// No context here: the DHT's lifetime is bounded by its own Close, which
+		// node.close calls.
+		kad, err := dht.New(host, dht.Mode(dht.ModeClient), dht.BootstrapPeers(peers...))
+		if err != nil {
+			node.close()
+			return nil, fmt.Errorf("starting the dht: %w", err)
+		}
+
+		node.dht = kad
+		providerFinder = kad
+	}
+
+	network := bsnet.NewFromIpfsHost(host)
+	node.bs = bsclient.New(nodeCtx, network, providerFinder, blockstore.NewBlockstore(datastore.NewNullDatastore()))
+	network.Start(node.bs)
 
 	if err := connectToPeers(ctx, host, peers); err != nil {
 		node.close()
 		return nil, err
 	}
 
+	if node.dht != nil {
+		node.bootstrapDHT(ctx)
+	}
+
 	return node, nil
+}
+
+// bootstrapDHT populates the routing table and waits, briefly, for it to hold at
+// least one peer. A provider lookup against an empty table finds nothing, so
+// starting the download before then spends the caller's deadline on a query that
+// cannot yet succeed.
+//
+// Failing to get a usable table is never fatal: directly connected peers may
+// still hold the content, and the table keeps filling while the download runs.
+func (node *node) bootstrapDHT(ctx context.Context) {
+	if err := node.dht.Bootstrap(ctx); err != nil {
+		fmt.Printf("failed to bootstrap the dht: %s\n", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, dhtReadyTimeout)
+	defer cancel()
+
+	ticker := time.NewTicker(dhtReadyPoll)
+	defer ticker.Stop()
+
+	for node.dht.RoutingTable().Size() == 0 {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			fmt.Printf("dht routing table still empty after %s, continuing anyway\n", dhtReadyTimeout)
+			return
+		}
+	}
 }
 
 func (node *node) download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
@@ -117,9 +182,18 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 	return os.Rename(staged, output)
 }
 
+// close tolerates a partially built node, since startNode calls it to unwind a
+// failed start.
 func (node *node) close() {
 	node.cancel()
-	node.bs.Close()
+
+	if node.bs != nil {
+		node.bs.Close()
+	}
+	if node.dht != nil {
+		node.dht.Close()
+	}
+
 	node.host.Close()
 }
 

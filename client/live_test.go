@@ -11,19 +11,67 @@
 package client
 
 import (
-	"bytes"
-	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"context"
 )
 
-// Mirrors Constants.IPFS_BOOTSTRAP_NODES in acurast-data-transmitter, so these
-// tests exercise what the processor actually dials in production.
+// treeDigest walks output, which may be a single file or a UnixFS directory, and
+// returns the total bytes together with a stable digest of the whole tree.
+//
+// The default CID is a directory, so this also gives the directory branch of
+// files.WriteTo its only coverage anywhere in the suite.
+func treeDigest(t *testing.T, root string) (int64, string) {
+	t.Helper()
+
+	hash := sha256.New()
+	var total int64
+
+	// WalkDir visits lexically, so the digest is deterministic.
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		fmt.Fprintf(hash, "%s:%d\n", relative, len(content))
+		hash.Write(content)
+		total += int64(len(content))
+
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the downloaded tree: %v", err)
+	}
+
+	return total, hex.EncodeToString(hash.Sum(nil))
+}
+
+// Mirrors Constants.IPFS_BOOTSTRAP_NODES in acurast-data-transmitter, minus the
+// Pinata bitswap gateway. These are DHT bootstrap nodes: they hold no content
+// themselves, so retrieving anything through them exercises the DHT provider
+// lookup end to end.
 var defaultLivePeers = []string{
-	"/dns4/bitswap.pinata.cloud/tcp/3000/ws/p2p/Qma8ddFEQWEU8ijWvdxXm3nxU7oHsRtCykAaVz8WUYhiKn",
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcMqAqQPR2i9bChDtGNJchTbq5TbXJJ16u19uLTa",
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMoJPWSCR5Zhtx6BHJX9KiKNN6tpvbUcqanj75Nb",
@@ -32,9 +80,15 @@ var defaultLivePeers = []string{
 	"/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
 }
 
-// The processor's own health-check content, fetched by HeartbeatService on every
-// heartbeat, so it is as reliably pinned as anything this project depends on.
-const defaultLiveCID = "QmSHJwK2EW2Ruq4bZUTNyMxw37Rx6bZjyaqwXrJ7i63EhQ"
+// The readme shipped with every kubo init, so it is about the most widely
+// replicated and announced content on the public network.
+//
+// Deliberately not the processor's own health-check CID
+// (QmSHJwK2EW2Ruq4bZUTNyMxw37Rx6bZjyaqwXrJ7i63EhQ): measured against the public
+// DHT that one resolves to zero providers, because whoever pins it serves it
+// over a direct bitswap connection without publishing provider records. It is
+// therefore unreachable by content routing, and useless for testing it.
+const defaultLiveCID = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
 
 // Public IPFS retrieval is slow and variable; these are deliberately generous.
 const (
@@ -97,15 +151,12 @@ func TestLiveDownload(t *testing.T) {
 		t.Fatalf("live download failed: %v (%d peers connected)", err, connectedPeers(client))
 	}
 
-	content, err := os.ReadFile(output)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(content) == 0 {
-		t.Error("downloaded an empty file")
+	total, _ := treeDigest(t, output)
+	if total == 0 {
+		t.Error("downloaded nothing")
 	}
 
-	t.Logf("fetched %d bytes for %s", len(content), liveCID())
+	t.Logf("fetched %d bytes for %s", total, liveCID())
 }
 
 // The second fetch reuses the already connected node, which is the point of the
@@ -132,16 +183,11 @@ func TestLiveDownloadReusesConnections(t *testing.T) {
 
 	t.Logf("cold = %v, warm = %v", cold, warm)
 
-	first, err := os.ReadFile(filepath.Join(dir, "cold"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := os.ReadFile(filepath.Join(dir, "warm"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(first, second) {
-		t.Error("the two downloads disagree on the content")
+	coldSize, coldDigest := treeDigest(t, filepath.Join(dir, "cold"))
+	warmSize, warmDigest := treeDigest(t, filepath.Join(dir, "warm"))
+
+	if coldDigest != warmDigest || coldSize != warmSize {
+		t.Errorf("the two downloads disagree: %d bytes %s vs %d bytes %s", coldSize, coldDigest, warmSize, warmDigest)
 	}
 }
 
