@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -41,6 +42,26 @@ type Config struct {
 	// information over many peers instead of handing it to one party. Point it at
 	// an endpoint you run if that matters to you.
 	DelegatedRoutingEndpoint string
+
+	// Gateways are HTTP gateway URLs, for example "https://ipfs.io", fetched
+	// from alongside libp2p peers. Blocks they return are verified like any
+	// other, so this costs nothing in trust.
+	Gateways []string
+
+	// AllowUnverifiedGatewayFallback permits a last-resort whole-file fetch from
+	// Gateways when every verified route has failed.
+	//
+	// Read that carefully before enabling it. A whole-file gateway response
+	// CANNOT be checked against its CID: the CID commits to a DAG - chunk size,
+	// leaf format, layout - none of which is recoverable from flat bytes, so
+	// identical content can legitimately carry different CIDs. Content arriving
+	// this way is trusted purely because the gateway said so, and a compromised
+	// or confused gateway can substitute anything.
+	//
+	// It exists because some gateways serve files but not blocks, and a caller
+	// may reasonably prefer unverified content to no content. Every other route
+	// in this package verifies.
+	AllowUnverifiedGatewayFallback bool
 }
 
 // Client is a reusable handle over an IPFS node. The node is started on the
@@ -53,6 +74,11 @@ type Config struct {
 type Client struct {
 	config nodeConfig
 	idle   time.Duration
+
+	// Retained as URLs for the unverified fallback, which talks plain HTTP and
+	// so needs no peer representation.
+	gateways        []string
+	allowUnverified bool
 
 	mutex    sync.Mutex
 	node     *node
@@ -69,10 +95,16 @@ func New(config *Config) (*Client, error) {
 		return nil, err
 	}
 
+	gateways, err := parseGateways(config.Gateways)
+	if err != nil {
+		return nil, err
+	}
+
 	node := nodeConfig{
 		port:       config.Port,
 		peers:      peers,
 		disableDHT: config.DisableDHT,
+		gateways:   gateways,
 	}
 
 	// Built once and shared by every node this Client starts. Doing it here also
@@ -86,12 +118,92 @@ func New(config *Config) (*Client, error) {
 		node.delegated = delegated
 	}
 
-	return &Client{config: node, idle: config.IdleTimeout}, nil
+	return &Client{
+		config:          node,
+		idle:            config.IdleTimeout,
+		gateways:        config.Gateways,
+		allowUnverified: config.AllowUnverifiedGatewayFallback,
+	}, nil
 }
 
 // Get downloads cid to output, giving up when ctx is done. A sizeLimit above
 // zero rejects content larger than that many bytes before it is written.
+//
+// Content is fetched from libp2p peers and HTTP gateways together, verified
+// block by block. Only if that fails, and Config.AllowUnverifiedGatewayFallback
+// is set, does it fall back to an unverified whole-file gateway fetch.
 func (client *Client) Get(ctx context.Context, cid string, output string, sizeLimit int64) error {
+	verified, cancel := client.verifiedDeadline(ctx)
+	defer cancel()
+
+	err := client.getVerified(verified, cid, output, sizeLimit)
+	if err == nil {
+		return nil
+	}
+
+	// No other source returns smaller content.
+	var tooBig *SizeLimitError
+	if errors.As(err, &tooBig) {
+		return err
+	}
+
+	// The caller's own deadline or cancellation ends it here. Only the internal
+	// verified-phase deadline above leaves budget to try anything else.
+	if ctx.Err() != nil {
+		return contextError(ctx)
+	}
+
+	if !client.allowUnverified || len(client.gateways) == 0 {
+		return err
+	}
+
+	fmt.Printf("verified retrieval of %s failed (%s), trying gateways unverified\n", cid, err)
+
+	fallbackErr := client.fetchFromGateways(ctx, cid, output, sizeLimit)
+	if fallbackErr == nil {
+		return nil
+	}
+
+	// A size limit failure has to surface on its own. errors.Join concatenates
+	// messages, and the Kotlin wrapper selects SizeLimitExceededException by
+	// testing the message prefix, so joining it behind the verified failure would
+	// silently downgrade it to a plain IOException at the call site.
+	if errors.As(fallbackErr, &tooBig) {
+		return fallbackErr
+	}
+
+	// Otherwise both failures matter: the verified one says why the network could
+	// not serve it, the fallback one why the gateways could not either.
+	return errors.Join(err, fallbackErr)
+}
+
+// verifiedShare is how much of the caller's remaining time the verified routes
+// may use before the unverified fallback gets its turn. A verified route that
+// hangs must not spend the entire budget and leave nothing to fall back with.
+const verifiedShare = 0.75
+
+func (client *Client) verifiedDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if !client.allowUnverified || len(client.gateways) == 0 {
+		return context.WithCancel(ctx)
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		// Nothing to divide: the verified path runs until it fails on its own.
+		return context.WithCancel(ctx)
+	}
+
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.WithCancel(ctx)
+	}
+
+	return context.WithTimeout(ctx, time.Duration(float64(remaining)*verifiedShare))
+}
+
+// getVerified fetches over libp2p and HTTP block exchange, where every block is
+// checked against the CID that asked for it.
+func (client *Client) getVerified(ctx context.Context, cid string, output string, sizeLimit int64) error {
 	result := make(chan error, 1)
 
 	// Node startup runs under ctx as well: it dials bootstrap peers, which is

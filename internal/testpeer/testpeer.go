@@ -16,6 +16,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,6 +40,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	multihash "github.com/multiformats/go-multihash"
 )
 
 // UnreachableCID is well formed but served by nobody, so a download of it blocks
@@ -123,6 +128,96 @@ func ServeIsolated(t *testing.T, content []byte) (bootstrapAddr string, provider
 	root = serveContent(t, providerHost, content)
 
 	return peerAddr(t, bootstrapHost), peerAddr(t, providerHost), root
+}
+
+// ServeTrustlessGateway starts an HTTP gateway that answers the block requests a
+// verified fetch makes: GET /ipfs/<cid>?format=raw with Accept
+// application/vnd.ipld.raw, returning that single block's bytes.
+//
+// It reports how many block requests it served, so a test can prove retrieval
+// actually went through the gateway rather than somewhere else.
+func ServeTrustlessGateway(t *testing.T, content []byte) (gatewayURL string, root string, blockRequests *atomic.Int32) {
+	t.Helper()
+
+	store := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	rootCid := addUnixfsFile(t, store, content)
+	blockRequests = &atomic.Int32{}
+
+	handler := http.NewServeMux()
+	handler.HandleFunc("/ipfs/", func(w http.ResponseWriter, r *http.Request) {
+		requested := strings.TrimPrefix(r.URL.Path, "/ipfs/")
+
+		parsed, err := cid.Parse(requested)
+		if err != nil {
+			http.Error(w, "bad cid", http.StatusBadRequest)
+			return
+		}
+
+		// httpnet probes an endpoint for liveness with bafkqaaa, the identity
+		// CID, before it will use it. An identity CID inlines its own content, so
+		// a real gateway answers from the multihash without any lookup; without
+		// this the probe 404s and the gateway is never used at all.
+		if decoded, err := multihash.Decode(parsed.Hash()); err == nil && decoded.Code == multihash.IDENTITY {
+			w.Header().Set("Content-Type", "application/vnd.ipld.raw")
+			w.Write(decoded.Digest)
+			return
+		}
+
+		block, err := store.Get(r.Context(), parsed)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		// Only a raw block request counts; anything else is a different protocol.
+		if r.URL.Query().Get("format") == "raw" || strings.Contains(r.Header.Get("Accept"), "application/vnd.ipld.raw") {
+			blockRequests.Add(1)
+			w.Header().Set("Content-Type", "application/vnd.ipld.raw")
+			w.Write(block.RawData())
+			return
+		}
+
+		http.Error(w, "only raw blocks served here", http.StatusNotAcceptable)
+	})
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	return server.URL, rootCid.String(), blockRequests
+}
+
+// ServeWholeFileGateway starts an HTTP gateway that serves complete files and
+// refuses block requests, the way a gateway without trustless support behaves.
+//
+// Retrieval through it cannot be verified, which is exactly what makes it the
+// fixture for the unverified fallback. servedBody lets a test hand back content
+// that does not match the CID, to check what the client does with it.
+func ServeWholeFileGateway(t *testing.T, root string, servedBody []byte) (gatewayURL string, requests *atomic.Int32) {
+	t.Helper()
+
+	requests = &atomic.Int32{}
+
+	handler := http.NewServeMux()
+	handler.HandleFunc("/ipfs/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("format") == "raw" || strings.Contains(r.Header.Get("Accept"), "application/vnd.ipld.raw") {
+			http.Error(w, "no trustless support", http.StatusNotAcceptable)
+			return
+		}
+
+		if strings.TrimPrefix(r.URL.Path, "/ipfs/") != root {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(servedBody)
+	})
+
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	return server.URL, requests
 }
 
 // Stalled returns the multiaddr of a listener that accepts TCP connections and

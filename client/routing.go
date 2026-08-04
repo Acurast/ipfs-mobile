@@ -30,6 +30,15 @@ func newDelegatedRouter(endpoint string) (routing.ContentDiscovery, error) {
 		endpoint,
 		routinghttp.WithUserAgent(userAgent),
 		routinghttp.WithHTTPClient(&http.Client{Transport: jsonOnlyTransport{}}),
+		// boxo defaults to {"unknown", "transport-bitswap"}, which throws away
+		// gateway records. cid.contact returns both kinds for the same content -
+		// a bitswap peer and an HTTP gateway - and since the exchange now speaks
+		// HTTP too, discarding the gateway would discard a working route.
+		routinghttp.WithProtocolFilter([]string{
+			"unknown",
+			"transport-bitswap",
+			"transport-ipfs-gateway-http",
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("delegated routing endpoint %q: %w", endpoint, err)

@@ -18,6 +18,10 @@ type Config struct {
 	// DelegatedRouting is the optional delegated routing v1 endpoint described
 	// on NewClient. Empty disables it.
 	DelegatedRouting string
+
+	// Gateways and AllowUnverifiedGatewayFallback are as described on NewClient.
+	Gateways                       string
+	AllowUnverifiedGatewayFallback bool
 }
 
 // Client is a reusable handle over a running IPFS node. Bootstrap peers are
@@ -42,12 +46,30 @@ type Client struct {
 // It finds content that is indexed but never announced to the DHT, which is how
 // large pinning services publish; the trade is that the endpoint learns which
 // CIDs are being fetched, so point it at one you run if that matters.
-func NewClient(bootstrapPeers string, port int32, idleTimeout int64, delegatedRouting string) (*Client, error) {
+// gateways is a ";" separated list of HTTP gateway URLs such as
+// "https://ipfs.io". They are fetched from alongside libp2p peers and what they
+// return is verified, so adding them costs nothing in trust.
+//
+// allowUnverifiedGatewayFallback additionally permits a last-resort whole-file
+// fetch from those gateways once every verified route has failed. That content
+// CANNOT be checked against its CID and is trusted purely because the gateway
+// said so; it exists because some gateways serve files but not blocks, and a
+// caller may prefer unverified content to none.
+func NewClient(
+	bootstrapPeers string,
+	port int32,
+	idleTimeout int64,
+	delegatedRouting string,
+	gateways string,
+	allowUnverifiedGatewayFallback bool,
+) (*Client, error) {
 	inner, err := client.New(&client.Config{
-		BootstrapPeers:           utils.GetStringSlice(bootstrapPeers),
-		Port:                     port,
-		IdleTimeout:              time.Duration(idleTimeout) * time.Millisecond,
-		DelegatedRoutingEndpoint: delegatedRouting,
+		BootstrapPeers:                 utils.GetStringSlice(bootstrapPeers),
+		Port:                           port,
+		IdleTimeout:                    time.Duration(idleTimeout) * time.Millisecond,
+		DelegatedRoutingEndpoint:       delegatedRouting,
+		Gateways:                       utils.GetStringSlice(gateways),
+		AllowUnverifiedGatewayFallback: allowUnverifiedGatewayFallback,
 	})
 	if err != nil {
 		return nil, err
@@ -75,7 +97,14 @@ func (client *Client) Close() error {
 // the call, re-dialling the bootstrap peers every time. Prefer NewClient when
 // fetching more than once.
 func Get(cid string, output string, config *Config) error {
-	client, err := NewClient(config.BootstrapPeers, config.Port, 0, config.DelegatedRouting)
+	client, err := NewClient(
+		config.BootstrapPeers,
+		config.Port,
+		0,
+		config.DelegatedRouting,
+		config.Gateways,
+		config.AllowUnverifiedGatewayFallback,
+	)
 	if err != nil {
 		return err
 	}

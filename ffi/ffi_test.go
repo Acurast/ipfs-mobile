@@ -14,7 +14,7 @@ import (
 func newTestClient(t *testing.T, bootstrapPeers string, idleTimeout int64) *Client {
 	t.Helper()
 
-	client, err := NewClient(bootstrapPeers, 0, idleTimeout, "")
+	client, err := NewClient(bootstrapPeers, 0, idleTimeout, "", "", false)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestNewClientRejectsUnusablePeerLists(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client, err := NewClient(test.peers, 0, 0, "")
+			client, err := NewClient(test.peers, 0, 0, "", "", false)
 			if err == nil {
 				client.Close()
 				t.Fatal("expected an error, got nil")
@@ -164,7 +164,7 @@ func TestClientGetEnforcesSizeLimit(t *testing.T) {
 func TestClientCloseIsIdempotent(t *testing.T) {
 	addr, _ := testpeer.Serve(t, testpeer.Content(64))
 
-	client, err := NewClient(addr, 0, 0, "")
+	client, err := NewClient(addr, 0, 0, "", "", false)
 	if err != nil {
 		t.Fatal(err)
 	}

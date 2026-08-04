@@ -337,3 +337,95 @@ func TestLiveDHTAloneCannotFindIndexedOnlyContent(t *testing.T) {
 
 	t.Logf("dht alone: %v (%d peers connected)", err, connectedPeers(client))
 }
+
+// The default gateway list from Constants.IPFS_GATEWAYS in
+// acurast-data-transmitter, so these exercise what the processor really uses.
+var defaultLiveGateways = []string{
+	"https://ipfs.io",
+	"https://dweb.link",
+	"https://gateway.pinata.cloud",
+	"https://ipfs.filebase.io",
+}
+
+// Surveys which of the configured gateways actually serve verified blocks.
+//
+// Written as a survey rather than an assertion because the answer is a property
+// of someone else's infrastructure, not of this library: our side is covered
+// offline by TestGatewayServesVerifiedBlocks against a local trustless gateway.
+// Asserting here just produced a test that failed whenever a third party had a
+// bad minute.
+//
+// The result is worth recording. Verified retrieval is patchy in practice:
+// subdomain gateways answer /ipfs/<cid>?format=raw with a 301 that httpnet does
+// not follow, and at least one has sent HTTP/2 headers larger than Go's client
+// accepts. That is precisely why the unverified fallback exists.
+func TestLiveGatewayVerifiedBlockSupport(t *testing.T) {
+	var supported []string
+
+	for _, gateway := range defaultLiveGateways {
+		client, err := New(&Config{
+			BootstrapPeers: livePeers(),
+			DisableDHT:     true,
+			Gateways:       []string{gateway},
+		})
+		if err != nil {
+			t.Errorf("%s: %v", gateway, err)
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = client.Get(ctx, pinataOnlyCID, filepath.Join(t.TempDir(), "out"), -1)
+		cancel()
+		client.Close()
+
+		if err != nil {
+			t.Logf("  %-32s no  (%v)", gateway, err)
+			continue
+		}
+
+		t.Logf("  %-32s yes", gateway)
+		supported = append(supported, gateway)
+	}
+
+	t.Logf("%d/%d configured gateways served verified blocks", len(supported), len(defaultLiveGateways))
+
+	if len(supported) == 0 {
+		t.Skip("no configured gateway currently serves verified blocks; the unverified fallback is carrying this entirely")
+	}
+}
+
+// Everything at once, which is the configuration a processor would actually run.
+func TestLiveAllRoutesTogether(t *testing.T) {
+	client, err := New(&Config{
+		BootstrapPeers:                 livePeers(),
+		DelegatedRoutingEndpoint:       "https://cid.contact",
+		Gateways:                       defaultLiveGateways,
+		AllowUnverifiedGatewayFallback: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
+	defer cancel()
+
+	for _, target := range []struct {
+		name string
+		cid  string
+	}{
+		{"indexed only (pinata)", pinataOnlyCID},
+		{"dht announced", liveCID()},
+	} {
+		t.Run(target.name, func(t *testing.T) {
+			start := time.Now()
+			output := filepath.Join(t.TempDir(), "out")
+			if err := client.Get(ctx, target.cid, output, -1); err != nil {
+				t.Fatalf("%s: %v (%d peers connected)", target.name, err, connectedPeers(client))
+			}
+
+			total, _ := treeDigest(t, output)
+			t.Logf("%s: %d bytes in %v", target.name, total, time.Since(start).Truncate(time.Millisecond))
+		})
+	}
+}

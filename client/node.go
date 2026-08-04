@@ -22,7 +22,9 @@ import (
 	"github.com/multiformats/go-multiaddr"
 
 	bsclient "github.com/ipfs/boxo/bitswap/client"
+	"github.com/ipfs/boxo/bitswap/network"
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
+	"github.com/ipfs/boxo/bitswap/network/httpnet"
 	"github.com/ipfs/boxo/blockservice"
 	"github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/files"
@@ -44,6 +46,7 @@ type node struct {
 	cancel context.CancelFunc
 	host   host.Host
 	dht    *dht.IpfsDHT
+	http   network.BitSwapNetwork
 	bs     *bsclient.Client
 }
 
@@ -53,6 +56,11 @@ type nodeConfig struct {
 	port       int32
 	peers      []peer.AddrInfo
 	disableDHT bool
+
+	// gateways are fetched from over HTTP as ordinary peers, not as a fallback:
+	// blocks they return are verified like any other, and they are asked at the
+	// same time as libp2p peers rather than after those give up.
+	gateways []peer.AddrInfo
 
 	// delegated is nil unless a delegated routing endpoint was configured.
 	delegated routing.ContentDiscovery
@@ -93,18 +101,33 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 		kadFinder = kad
 	}
 
-	network := bsnet.NewFromIpfsHost(host)
+	// One exchange over two transports. The router sends a want to whichever of
+	// the two a given peer speaks, so an HTTP gateway and a libp2p peer are both
+	// just peers that might have the block.
+	node.http = httpnet.New(host, httpnet.WithUserAgent(userAgent))
+	exchange := network.New(host.Peerstore(), bsnet.NewFromIpfsHost(host), node.http)
+
 	node.bs = bsclient.New(
 		nodeCtx,
-		network,
+		exchange,
 		newProviderFinder(kadFinder, config.delegated),
 		blockstore.NewBlockstore(datastore.NewNullDatastore()),
 	)
-	network.Start(node.bs)
+	exchange.Start(node.bs)
+
+	// Gateways are dialled first and do not count towards needing a libp2p peer:
+	// a reachable gateway alone is enough to retrieve content, which is the whole
+	// point of having them.
+	gateways := connectToGateways(ctx, node.http, config.gateways)
 
 	if err := connectToPeers(ctx, host, config.peers); err != nil {
-		node.close()
-		return nil, err
+		if gateways == 0 {
+			node.close()
+			return nil, err
+		}
+
+		// Some content is served only over HTTP anyway, so carry on.
+		fmt.Printf("continuing with %d gateway(s) despite: %s\n", gateways, err)
 	}
 
 	if node.dht != nil {
@@ -172,7 +195,7 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 		}
 
 		if size > sizeLimit {
-			return fmt.Errorf("size limit exceeded (actual size = %d limit = %d bytes)", size, sizeLimit)
+			return &SizeLimitError{Size: size, Limit: sizeLimit}
 		}
 	}
 
@@ -205,6 +228,9 @@ func (node *node) close() {
 
 	if node.bs != nil {
 		node.bs.Close()
+	}
+	if node.http != nil {
+		node.http.Stop()
 	}
 	if node.dht != nil {
 		node.dht.Close()
@@ -274,6 +300,52 @@ func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 	}
 
 	return peers, nil
+}
+
+// connectToGateways registers each gateway with the HTTP exchange and reports
+// how many answered. httpnet probes the URL rather than performing a libp2p
+// handshake, so "connecting" here just means the endpoint responded.
+//
+// Failures are logged, never fatal: gateways supplement the libp2p peers and an
+// unreachable one should cost nothing but the dial.
+func connectToGateways(ctx context.Context, exchange network.BitSwapNetwork, gateways []peer.AddrInfo) int {
+	if len(gateways) == 0 {
+		return 0
+	}
+
+	var (
+		wait      sync.WaitGroup
+		connected atomic.Int32
+	)
+
+	wait.Add(len(gateways))
+
+	for _, gateway := range gateways {
+		go func(gateway peer.AddrInfo) {
+			defer wait.Done()
+
+			if err := exchange.Connect(ctx, gateway); err != nil {
+				fmt.Printf("gateway %s unreachable: %s\n", gatewayName(gateway), err)
+				return
+			}
+
+			connected.Add(1)
+		}(gateway)
+	}
+
+	wait.Wait()
+
+	return int(connected.Load())
+}
+
+// gatewayName renders a gateway for logs. Its peer ID is a synthetic derived
+// from the URL, so printing that instead would be noise.
+func gatewayName(gateway peer.AddrInfo) string {
+	if len(gateway.Addrs) == 0 {
+		return gateway.ID.String()
+	}
+
+	return gateway.Addrs[0].String()
 }
 
 // connectToPeers dials every peer in parallel and returns as soon as one of them

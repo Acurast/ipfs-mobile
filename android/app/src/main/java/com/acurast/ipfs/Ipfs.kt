@@ -33,6 +33,16 @@ import ffi.Client as FfiClient
  * device fetches, so point it at one you run if that matters to you. Off by
  * default.
  *
+ * [gateways] are HTTP gateways fetched from alongside libp2p peers. What they
+ * return is verified block by block, so adding them costs nothing in trust.
+ *
+ * [allowUnverifiedGatewayFallback] additionally permits a last-resort whole-file
+ * fetch from those gateways once every verified route has failed. Understand the
+ * trade before enabling it: a whole-file response CANNOT be checked against its
+ * CID, so that content is trusted purely because the gateway said so. It exists
+ * because some gateways serve files but not blocks, and content that arrives
+ * unverified may still beat no content at all.
+ *
  * Instances are safe to share between coroutines.
  */
 public class Ipfs(
@@ -40,6 +50,8 @@ public class Ipfs(
     private val port: Int = PORT,
     private val idleTimeout: Duration? = IDLE_TIMEOUT,
     private val delegatedRouting: String? = null,
+    private val gateways: List<String> = emptyList(),
+    private val allowUnverifiedGatewayFallback: Boolean = false,
 ) : Closeable {
 
     private val lock = Any()
@@ -92,6 +104,8 @@ public class Ipfs(
             port,
             idleTimeout?.inWholeMilliseconds ?: NO_TIMEOUT,
             delegatedRouting ?: NO_DELEGATED_ROUTING,
+            gateways.joinToString(DELIMITER_LIST_STRING),
+            allowUnverifiedGatewayFallback,
         ).also { client = it }
     }
 
