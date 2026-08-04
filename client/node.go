@@ -2,12 +2,9 @@ package client
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -31,33 +28,49 @@ import (
 	unixfile "github.com/ipfs/boxo/ipld/unixfs/file"
 )
 
-type Node interface {
-	Download(ctx context.Context, cidStr string, output string, sizeLimit int64) error
-	Connect()
-	Close()
-}
-
-type NodeConcrete struct {
-	id        string
-	cancel    context.CancelFunc
-	connected int
-
+// node is a running libp2p host with a bitswap client attached. It is owned by
+// exactly one Client, which is the only thing allowed to close it.
+type node struct {
+	cancel context.CancelFunc
 	host   host.Host
-	client *bsclient.Client
+	bs     *bsclient.Client
 }
 
-type NodeConfig struct {
-	BootstrapPeers []string
-	Port           int32
+// startNode brings up a host and connects it to the bootstrap peers. It blocks
+// until the first peer is reachable, bounded by ctx: bitswap has nothing to ask
+// until it has a connection, so failing here beats letting the download hang.
+func startNode(ctx context.Context, port int32, peers []peer.AddrInfo) (*node, error) {
+	host, err := makeHost(port)
+	if err != nil {
+		return nil, err
+	}
+
+	// The node outlives any single request, so its lifetime is not tied to ctx.
+	nodeCtx, cancel := context.WithCancel(context.Background())
+
+	network := bsnet.NewFromIpfsHost(host, routinghelpers.Null{})
+	bs := bsclient.New(nodeCtx, network, blockstore.NewBlockstore(datastore.NewNullDatastore()))
+	network.Start(bs)
+
+	node := &node{cancel: cancel, host: host, bs: bs}
+
+	if err := connectToPeers(ctx, host, peers); err != nil {
+		node.close()
+		return nil, err
+	}
+
+	return node, nil
 }
 
-func (node *NodeConcrete) Download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
+func (node *node) download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
+	// cid.MustParse panics on a malformed CID, which would take the process down
+	// rather than surfacing as an error to the caller.
 	parsed, err := cid.Parse(cidStr)
 	if err != nil {
 		return fmt.Errorf("invalid cid %q: %w", cidStr, err)
 	}
 
-	bserv := blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), node.client)
+	bserv := blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), node.bs)
 	session := merkledag.NewSession(ctx, merkledag.NewDAGService(bserv))
 	dserv := merkledag.NewReadOnlyDagService(session)
 
@@ -82,7 +95,7 @@ func (node *NodeConcrete) Download(ctx context.Context, cidStr string, output st
 		}
 	}
 
-	// A download that hits the deadline is abandoned part way through the write,
+	// A download that hits its deadline is abandoned part way through the write,
 	// so stage it next to the target and move it into place only once complete.
 	// Otherwise a timed out call leaves a truncated file at output, and a retry
 	// races the abandoned write for the same path.
@@ -104,99 +117,15 @@ func (node *NodeConcrete) Download(ctx context.Context, cidStr string, output st
 	return os.Rename(staged, output)
 }
 
-func (node *NodeConcrete) Connect() {
-	node.connected++
-}
-
-func (node *NodeConcrete) Close() {
-	if !node.release() {
-		return
-	}
-
-	// host.Close waits on the host's background goroutines and client.Close
-	// waits for bitswap to shut down. Both run outside nodeMutex, or every
-	// concurrent GetNode stalls behind them with no deadline of its own.
+func (node *node) close() {
 	node.cancel()
-	node.client.Close()
+	node.bs.Close()
 	node.host.Close()
 }
 
-// release drops one reference to the node and reports whether it was the last
-// one. When it was, the node has already been removed from the registry - so a
-// concurrent GetNode starts a fresh one rather than waiting on this shutdown -
-// and the caller owns tearing it down.
-func (node *NodeConcrete) release() bool {
-	nodeMutex.Lock()
-	defer nodeMutex.Unlock()
-
-	node.connected--
-	if node.connected > 0 {
-		return false
-	}
-
-	delete(nodes, node.id)
-
-	return true
-}
-
-var (
-	nodes     = make(map[string]Node)
-	nodeMutex sync.Mutex
-)
-
-func GetNode(config *NodeConfig) (Node, error) {
-	id := getNodeId(config)
-
-	nodeMutex.Lock()
-	defer nodeMutex.Unlock()
-
-	if node, exists := nodes[id]; exists {
-		node.Connect()
-		return node, nil
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	host, client, err := startNode(ctx, config)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-
-	go func() {
-		err := connectToPeers(ctx, host, config.BootstrapPeers)
-		if err != nil {
-			fmt.Printf("failed to connect to peers: %s\n", err)
-		}
-	}()
-
-	node := &NodeConcrete{id, cancel, 1, host, client}
-
-	nodes[id] = node
-	return node, nil
-}
-
-func getNodeId(config *NodeConfig) string {
-	sort.Strings(config.BootstrapPeers)
-
-	hash := sha256.New()
-	hash.Write([]byte(fmt.Sprintf("%v", config)))
-
-	return hex.EncodeToString(hash.Sum(nil))
-}
-
-func startNode(ctx context.Context, config *NodeConfig) (host.Host, *bsclient.Client, error) {
-	host, err := makeHost(config.Port)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	client := startClient(ctx, host)
-
-	return host, client, nil
-}
-
 func makeHost(port int32) (host.Host, error) {
+	// Ed25519 rather than RSA-2048: the identity is ephemeral, and RSA key
+	// generation costs seconds on mobile ARM cores with a long tail.
 	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
 	if err != nil {
 		return nil, err
@@ -210,66 +139,102 @@ func makeHost(port int32) (host.Host, error) {
 	return libp2p.New(opts...)
 }
 
-func startClient(ctx context.Context, host host.Host) *bsclient.Client {
-	network := bsnet.NewFromIpfsHost(host, routinghelpers.Null{})
-	client := bsclient.New(ctx, network, blockstore.NewBlockstore(datastore.NewNullDatastore()))
-	network.Start(client)
+// parsePeers validates bootstrap addresses up front so a bad list fails when the
+// Client is built, rather than producing a node with nobody to talk to. Invalid
+// entries are skipped; only an entirely unusable list is an error.
+func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
+	infos := make(map[peer.ID]*peer.AddrInfo, len(addrs))
+	order := make([]peer.ID, 0, len(addrs))
 
-	return client
-}
-
-func connectToPeers(ctx context.Context, host host.Host, peers []string) error {
-	if len(peers) == 0 {
-		return fmt.Errorf("no bootstrap peers configured, there is nobody to fetch blocks from")
-	}
-
-	var wg sync.WaitGroup
-	peerInfos := make(map[peer.ID]*peer.AddrInfo, len(peers))
-	for _, addrStr := range peers {
+	for _, addrStr := range addrs {
 		addr, err := multiaddr.NewMultiaddr(addrStr)
 		if err != nil {
 			fmt.Printf("skipping invalid bootstrap peer %q: %s\n", addrStr, err)
 			continue
 		}
 
-		pii, err := peer.AddrInfoFromP2pAddr(addr)
+		parsed, err := peer.AddrInfoFromP2pAddr(addr)
 		if err != nil {
 			fmt.Printf("skipping invalid bootstrap peer %q: %s\n", addrStr, err)
 			continue
 		}
 
-		pi, ok := peerInfos[pii.ID]
-		if !ok {
-			pi = &peer.AddrInfo{ID: pii.ID}
-			peerInfos[pi.ID] = pi
+		info, seen := infos[parsed.ID]
+		if !seen {
+			info = &peer.AddrInfo{ID: parsed.ID}
+			infos[info.ID] = info
+			order = append(order, info.ID)
 		}
 
-		pi.Addrs = append(pi.Addrs, pii.Addrs...)
+		info.Addrs = append(info.Addrs, parsed.Addrs...)
 	}
 
-	if len(peerInfos) == 0 {
-		return fmt.Errorf("none of the %d configured bootstrap peers is a valid address", len(peers))
+	if len(infos) == 0 {
+		if len(addrs) == 0 {
+			return nil, fmt.Errorf("no bootstrap peers configured, there is nobody to fetch blocks from")
+		}
+
+		return nil, fmt.Errorf("none of the %d configured bootstrap peers is a valid address", len(addrs))
 	}
 
-	var connected atomic.Int32
+	// Keep the configured order rather than the map's, so behaviour is stable.
+	peers := make([]peer.AddrInfo, 0, len(order))
+	for _, id := range order {
+		peers = append(peers, *infos[id])
+	}
 
-	wg.Add(len(peerInfos))
-	for _, peerInfo := range peerInfos {
-		go func(peerInfo *peer.AddrInfo) {
+	return peers, nil
+}
+
+// connectToPeers dials every peer in parallel and returns as soon as one of them
+// answers. The rest keep dialling in the background: more peers is strictly
+// better for bitswap, but waiting for the slowest one is not.
+func connectToPeers(ctx context.Context, host host.Host, peers []peer.AddrInfo) error {
+	if len(peers) == 0 {
+		return fmt.Errorf("no bootstrap peers configured, there is nobody to fetch blocks from")
+	}
+
+	var (
+		wg        sync.WaitGroup
+		once      sync.Once
+		connected atomic.Int32
+	)
+
+	first := make(chan struct{})
+	wg.Add(len(peers))
+
+	for _, peerInfo := range peers {
+		go func(peerInfo peer.AddrInfo) {
 			defer wg.Done()
-			err := host.Connect(ctx, *peerInfo)
-			if err != nil {
+
+			if err := host.Connect(ctx, peerInfo); err != nil {
 				fmt.Printf("failed to connect to %s: %s\n", peerInfo.ID, err)
 				return
 			}
+
 			connected.Add(1)
+			once.Do(func() { close(first) })
 		}(peerInfo)
 	}
-	wg.Wait()
 
-	if connected.Load() == 0 {
-		return fmt.Errorf("failed to connect to any of the %d bootstrap peers", len(peerInfos))
+	exhausted := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(exhausted)
+	}()
+
+	select {
+	case <-first:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-exhausted:
+		// Every dial finished. A success racing the last failure would leave both
+		// channels ready, so re-check rather than trusting the select.
+		if connected.Load() > 0 {
+			return nil
+		}
+
+		return fmt.Errorf("failed to connect to any of the %d bootstrap peers", len(peers))
 	}
-
-	return nil
 }
