@@ -25,12 +25,21 @@ import ffi.Client as FfiClient
  *  - pass `null` for [idleTimeout] to keep the node up until you [close] it,
  *    which suits a long lived client that fetches often.
  *
+ * Content is located through the DHT. Set [delegatedRouting] to additionally
+ * query a delegated routing v1 endpoint, an IPNI indexer such as
+ * `https://cid.contact`. That matters because large pinning services publish to
+ * an indexer rather than announcing every CID to the DHT, so some content is
+ * findable no other way. The trade is that the endpoint learns which CIDs this
+ * device fetches, so point it at one you run if that matters to you. Off by
+ * default.
+ *
  * Instances are safe to share between coroutines.
  */
 public class Ipfs(
     private val bootstrapNodes: List<String> = emptyList(),
     private val port: Int = PORT,
     private val idleTimeout: Duration? = IDLE_TIMEOUT,
+    private val delegatedRouting: String? = null,
 ) : Closeable {
 
     private val lock = Any()
@@ -82,6 +91,7 @@ public class Ipfs(
             bootstrapNodes.joinToString(DELIMITER_LIST_STRING),
             port,
             idleTimeout?.inWholeMilliseconds ?: NO_TIMEOUT,
+            delegatedRouting ?: NO_DELEGATED_ROUTING,
         ).also { client = it }
     }
 
@@ -110,6 +120,9 @@ public class Ipfs(
         /** The FFI encodes "no limit" and "no timeout" as a negative value. */
         private const val NO_SIZE_LIMIT = -1L
         private const val NO_TIMEOUT = -1L
+
+        /** ...and "no delegated routing endpoint" as an empty string. */
+        private const val NO_DELEGATED_ROUTING = ""
 
         private const val DIR_IPFS = "ipfs"
         private const val DIR_DATA = "data"

@@ -288,3 +288,52 @@ func TestLiveBootstrapPeersAreReachable(t *testing.T) {
 		t.Error("no configured bootstrap peer is reachable")
 	}
 }
+
+// The CID that started this: served by Pinata, indexed by cid.contact, and
+// absent from the DHT. It is the case delegated routing exists to cover.
+const pinataOnlyCID = "QmSHJwK2EW2Ruq4bZUTNyMxw37Rx6bZjyaqwXrJ7i63EhQ"
+
+// Retrieving it proves the indexer path works against the real network, with
+// Pinata nowhere in the bootstrap list.
+func TestLiveDelegatedRoutingFindsIndexedOnlyContent(t *testing.T) {
+	client, err := New(&Config{
+		BootstrapPeers:           livePeers(),
+		DelegatedRoutingEndpoint: "https://cid.contact",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
+	defer cancel()
+
+	start := time.Now()
+	output := filepath.Join(t.TempDir(), "out")
+	if err := client.Get(ctx, pinataOnlyCID, output, -1); err != nil {
+		t.Fatalf("indexer lookup failed: %v (%d peers connected)", err, connectedPeers(client))
+	}
+
+	content, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("fetched %d bytes in %v via cid.contact: %q", len(content), time.Since(start).Truncate(time.Millisecond), strings.TrimSpace(string(content)))
+}
+
+// The control: the same CID with only the DHT configured. It is not announced
+// there, so this cannot succeed.
+func TestLiveDHTAloneCannotFindIndexedOnlyContent(t *testing.T) {
+	client := liveClient(t, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err := client.Get(ctx, pinataOnlyCID, filepath.Join(t.TempDir(), "out"), -1)
+	if err == nil {
+		t.Skip("the content is now announced to the DHT; nothing to assert")
+	}
+
+	t.Logf("dht alone: %v (%d peers connected)", err, connectedPeers(client))
+}

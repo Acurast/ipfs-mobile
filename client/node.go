@@ -47,11 +47,22 @@ type node struct {
 	bs     *bsclient.Client
 }
 
+// nodeConfig is everything a node needs to start. It is built once, when the
+// Client is created, and reused every time the node is restarted.
+type nodeConfig struct {
+	port       int32
+	peers      []peer.AddrInfo
+	disableDHT bool
+
+	// delegated is nil unless a delegated routing endpoint was configured.
+	delegated routing.ContentDiscovery
+}
+
 // startNode brings up a host and connects it to the bootstrap peers. It blocks
 // until the first peer is reachable, bounded by ctx: bitswap has nothing to ask
 // until it has a connection, so failing here beats letting the download hang.
-func startNode(ctx context.Context, port int32, peers []peer.AddrInfo, disableDHT bool) (*node, error) {
-	host, err := makeHost(port)
+func startNode(ctx context.Context, config nodeConfig) (*node, error) {
+	host, err := makeHost(config.port)
 	if err != nil {
 		return nil, err
 	}
@@ -61,32 +72,37 @@ func startNode(ctx context.Context, port int32, peers []peer.AddrInfo, disableDH
 
 	node := &node{cancel: cancel, host: host}
 
-	// Without a provider finder bitswap has no content routing at all, and can
-	// only fetch from peers it happens to be directly connected to. The DHT is
-	// what lets it find whoever actually holds a CID.
-	var providerFinder routing.ContentDiscovery
+	// Without any provider finder bitswap has no content routing at all, and can
+	// only fetch from peers it happens to be directly connected to.
+	var kadFinder routing.ContentDiscovery
 
-	if !disableDHT {
+	if !config.disableDHT {
 		// Client mode: query the DHT without answering queries for it. A phone is
 		// usually behind NAT and on a metered, battery powered connection, so it
 		// makes a poor DHT server.
+		//
 		// No context here: the DHT's lifetime is bounded by its own Close, which
 		// node.close calls.
-		kad, err := dht.New(host, dht.Mode(dht.ModeClient), dht.BootstrapPeers(peers...))
+		kad, err := dht.New(host, dht.Mode(dht.ModeClient), dht.BootstrapPeers(config.peers...))
 		if err != nil {
 			node.close()
 			return nil, fmt.Errorf("starting the dht: %w", err)
 		}
 
 		node.dht = kad
-		providerFinder = kad
+		kadFinder = kad
 	}
 
 	network := bsnet.NewFromIpfsHost(host)
-	node.bs = bsclient.New(nodeCtx, network, providerFinder, blockstore.NewBlockstore(datastore.NewNullDatastore()))
+	node.bs = bsclient.New(
+		nodeCtx,
+		network,
+		newProviderFinder(kadFinder, config.delegated),
+		blockstore.NewBlockstore(datastore.NewNullDatastore()),
+	)
 	network.Start(node.bs)
 
-	if err := connectToPeers(ctx, host, peers); err != nil {
+	if err := connectToPeers(ctx, host, config.peers); err != nil {
 		node.close()
 		return nil, err
 	}

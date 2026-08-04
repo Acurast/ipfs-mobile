@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-libp2p/core/peer"
-
 	"ipfs-mobile/utils"
 )
 
@@ -26,11 +24,23 @@ type Config struct {
 	// as long as it is open.
 	IdleTimeout time.Duration
 
-	// DisableDHT turns off provider lookups, leaving the node able to fetch only
-	// from the bootstrap peers it is directly connected to. Those peers do not
-	// generally hold arbitrary content, so this is rarely what you want outside
-	// of tests against a known peer.
+	// DisableDHT turns off DHT provider lookups, leaving the node able to fetch
+	// only from the bootstrap peers it is directly connected to, plus whatever
+	// DelegatedRoutingEndpoint turns up. Rarely what you want outside of tests
+	// against a known peer.
 	DisableDHT bool
+
+	// DelegatedRoutingEndpoint additionally resolves providers through a
+	// delegated routing v1 HTTP endpoint, an IPNI indexer such as
+	// "https://cid.contact". Empty disables it.
+	//
+	// Worth enabling because large pinning services publish to an indexer rather
+	// than announcing every CID to the DHT, so some content is findable only
+	// this way. Worth thinking about first because every lookup tells that
+	// endpoint which CID is being fetched, and by whom; the DHT spreads the same
+	// information over many peers instead of handing it to one party. Point it at
+	// an endpoint you run if that matters to you.
+	DelegatedRoutingEndpoint string
 }
 
 // Client is a reusable handle over an IPFS node. The node is started on the
@@ -41,10 +51,8 @@ type Config struct {
 // unless Config.IdleTimeout is set, in which case an unused node shuts itself
 // down and Close only needs to be called to retire the Client for good.
 type Client struct {
-	port       int32
-	peers      []peer.AddrInfo
-	idle       time.Duration
-	disableDHT bool
+	config nodeConfig
+	idle   time.Duration
 
 	mutex    sync.Mutex
 	node     *node
@@ -61,12 +69,24 @@ func New(config *Config) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{
+	node := nodeConfig{
 		port:       config.Port,
 		peers:      peers,
-		idle:       config.IdleTimeout,
 		disableDHT: config.DisableDHT,
-	}, nil
+	}
+
+	// Built once and shared by every node this Client starts. Doing it here also
+	// rejects a malformed endpoint up front rather than at the first download.
+	if config.DelegatedRoutingEndpoint != "" {
+		delegated, err := newDelegatedRouter(config.DelegatedRoutingEndpoint)
+		if err != nil {
+			return nil, err
+		}
+
+		node.delegated = delegated
+	}
+
+	return &Client{config: node, idle: config.IdleTimeout}, nil
 }
 
 // Get downloads cid to output, giving up when ctx is done. A sizeLimit above
@@ -169,7 +189,7 @@ func (client *Client) acquire(ctx context.Context) (*node, error) {
 	client.inflight++
 	client.mutex.Unlock()
 
-	node, err := startNode(ctx, client.port, client.peers, client.disableDHT)
+	node, err := startNode(ctx, client.config)
 	if err != nil {
 		client.release()
 		return nil, err

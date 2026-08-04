@@ -106,6 +106,25 @@ func ServeViaDHT(t *testing.T, content []byte) (bootstrapAddr string, root strin
 	return peerAddr(t, bootstrapHost), root
 }
 
+// ServeIsolated starts two peers: a bootstrap node holding no content, and a
+// provider that holds it but announces it nowhere at all - no DHT record, no
+// index entry. Returns both addresses and the root CID.
+//
+// A client given only the bootstrap address cannot reach the content by any
+// means of its own; something has to tell it where the provider is. That is what
+// makes this the right fixture for testing delegated routing, and the control
+// for testing that no routing means no retrieval.
+func ServeIsolated(t *testing.T, content []byte) (bootstrapAddr string, providerAddr string, root string) {
+	t.Helper()
+
+	bootstrapHost, _ := startPeer(t)
+
+	providerHost, _ := startPeer(t)
+	root = serveContent(t, providerHost, content)
+
+	return peerAddr(t, bootstrapHost), peerAddr(t, providerHost), root
+}
+
 // Stalled returns the multiaddr of a listener that accepts TCP connections and
 // then says nothing, so libp2p completes the dial and hangs in its security
 // handshake until the caller's deadline expires.

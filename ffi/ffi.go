@@ -14,6 +14,10 @@ type Config struct {
 	Port           int32
 	SizeLimit      int64
 	Timeout        int64
+
+	// DelegatedRouting is the optional delegated routing v1 endpoint described
+	// on NewClient. Empty disables it.
+	DelegatedRouting string
 }
 
 // Client is a reusable handle over a running IPFS node. Bootstrap peers are
@@ -32,11 +36,18 @@ type Client struct {
 // that long without a download; the next download starts a new one. Zero or
 // negative disables it, leaving the node up until Close is called. Either way
 // Close must be called when the Client is no longer needed.
-func NewClient(bootstrapPeers string, port int32, idleTimeout int64) (*Client, error) {
+//
+// delegatedRouting is an optional delegated routing v1 endpoint, an IPNI indexer
+// such as "https://cid.contact", queried alongside the DHT. Empty disables it.
+// It finds content that is indexed but never announced to the DHT, which is how
+// large pinning services publish; the trade is that the endpoint learns which
+// CIDs are being fetched, so point it at one you run if that matters.
+func NewClient(bootstrapPeers string, port int32, idleTimeout int64, delegatedRouting string) (*Client, error) {
 	inner, err := client.New(&client.Config{
-		BootstrapPeers: utils.GetStringSlice(bootstrapPeers),
-		Port:           port,
-		IdleTimeout:    time.Duration(idleTimeout) * time.Millisecond,
+		BootstrapPeers:           utils.GetStringSlice(bootstrapPeers),
+		Port:                     port,
+		IdleTimeout:              time.Duration(idleTimeout) * time.Millisecond,
+		DelegatedRoutingEndpoint: delegatedRouting,
 	})
 	if err != nil {
 		return nil, err
@@ -64,7 +75,7 @@ func (client *Client) Close() error {
 // the call, re-dialling the bootstrap peers every time. Prefer NewClient when
 // fetching more than once.
 func Get(cid string, output string, config *Config) error {
-	client, err := NewClient(config.BootstrapPeers, config.Port, 0)
+	client, err := NewClient(config.BootstrapPeers, config.Port, 0, config.DelegatedRouting)
 	if err != nil {
 		return err
 	}
