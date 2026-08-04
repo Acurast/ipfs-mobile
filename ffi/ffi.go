@@ -21,7 +21,7 @@ func Get(cid string, output string, config *Config) error {
 	}
 
 	var optTimeout *time.Duration = nil
-	if (config.Timeout >= 0) {
+	if config.Timeout >= 0 {
 		timeout := time.Duration(config.Timeout) * time.Millisecond
 		optTimeout = &timeout
 	}

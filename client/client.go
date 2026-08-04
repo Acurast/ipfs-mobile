@@ -13,25 +13,23 @@ type ExecConfig struct {
 }
 
 func Get(cid string, output string, nodeConfig *NodeConfig, execConfig *ExecConfig) error {
-	node, err := GetNode(nodeConfig)
-	if err != nil {
-		return err
-	}
-	defer node.Close()
-
-	if execConfig.Timeout == nil {
-		ctx, cancel := context.WithCancel(context.Background())
+	ctx := context.Background()
+	if execConfig.Timeout != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *execConfig.Timeout)
 		defer cancel()
-
-		return node.Download(ctx, cid, output, execConfig.SizeLimit)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), *execConfig.Timeout)
-	defer cancel()
 
 	result := make(chan error, 1)
 
 	go func() {
+		node, err := GetNode(nodeConfig)
+		if err != nil {
+			result <- err
+			return
+		}
+		defer node.Close()
+
 		result <- node.Download(ctx, cid, output, execConfig.SizeLimit)
 	}()
 

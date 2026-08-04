@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
@@ -39,8 +42,8 @@ type NodeConcrete struct {
 	cancel    context.CancelFunc
 	connected int
 
-	host      host.Host
-	client    *bsclient.Client
+	host   host.Host
+	client *bsclient.Client
 }
 
 type NodeConfig struct {
@@ -48,12 +51,17 @@ type NodeConfig struct {
 	Port           int32
 }
 
-func (node NodeConcrete) Download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
+func (node *NodeConcrete) Download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
+	parsed, err := cid.Parse(cidStr)
+	if err != nil {
+		return fmt.Errorf("invalid cid %q: %w", cidStr, err)
+	}
+
 	bserv := blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), node.client)
 	session := merkledag.NewSession(ctx, merkledag.NewDAGService(bserv))
 	dserv := merkledag.NewReadOnlyDagService(session)
 
-	nd, err := dserv.Get(ctx, cid.MustParse(cidStr))
+	nd, err := dserv.Get(ctx, parsed)
 	if err != nil {
 		return err
 	}
@@ -74,7 +82,26 @@ func (node NodeConcrete) Download(ctx context.Context, cidStr string, output str
 		}
 	}
 
-	return files.WriteTo(unixfsnd, output)
+	// A download that hits the deadline is abandoned part way through the write,
+	// so stage it next to the target and move it into place only once complete.
+	// Otherwise a timed out call leaves a truncated file at output, and a retry
+	// races the abandoned write for the same path.
+	scratch, err := os.MkdirTemp(filepath.Dir(output), ".ipfs-download-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(scratch)
+
+	staged := filepath.Join(scratch, "data")
+	if err := files.WriteTo(unixfsnd, staged); err != nil {
+		return err
+	}
+
+	if err := os.RemoveAll(output); err != nil {
+		return err
+	}
+
+	return os.Rename(staged, output)
 }
 
 func (node *NodeConcrete) Connect() {
@@ -82,20 +109,34 @@ func (node *NodeConcrete) Connect() {
 }
 
 func (node *NodeConcrete) Close() {
+	if !node.release() {
+		return
+	}
+
+	// host.Close waits on the host's background goroutines and client.Close
+	// waits for bitswap to shut down. Both run outside nodeMutex, or every
+	// concurrent GetNode stalls behind them with no deadline of its own.
+	node.cancel()
+	node.client.Close()
+	node.host.Close()
+}
+
+// release drops one reference to the node and reports whether it was the last
+// one. When it was, the node has already been removed from the registry - so a
+// concurrent GetNode starts a fresh one rather than waiting on this shutdown -
+// and the caller owns tearing it down.
+func (node *NodeConcrete) release() bool {
 	nodeMutex.Lock()
 	defer nodeMutex.Unlock()
 
 	node.connected--
 	if node.connected > 0 {
-		return
+		return false
 	}
-
-	node.host.Close()
-	node.client.Close()
 
 	delete(nodes, node.id)
 
-	node.cancel()
+	return true
 }
 
 var (
@@ -156,7 +197,7 @@ func startNode(ctx context.Context, config *NodeConfig) (host.Host, *bsclient.Cl
 }
 
 func makeHost(port int32) (host.Host, error) {
-	priv, _, err := crypto.GenerateKeyPair(crypto.RSA, 2048)
+	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -178,17 +219,23 @@ func startClient(ctx context.Context, host host.Host) *bsclient.Client {
 }
 
 func connectToPeers(ctx context.Context, host host.Host, peers []string) error {
+	if len(peers) == 0 {
+		return fmt.Errorf("no bootstrap peers configured, there is nobody to fetch blocks from")
+	}
+
 	var wg sync.WaitGroup
 	peerInfos := make(map[peer.ID]*peer.AddrInfo, len(peers))
 	for _, addrStr := range peers {
 		addr, err := multiaddr.NewMultiaddr(addrStr)
 		if err != nil {
-			return err
+			fmt.Printf("skipping invalid bootstrap peer %q: %s\n", addrStr, err)
+			continue
 		}
 
 		pii, err := peer.AddrInfoFromP2pAddr(addr)
 		if err != nil {
-			return err
+			fmt.Printf("skipping invalid bootstrap peer %q: %s\n", addrStr, err)
+			continue
 		}
 
 		pi, ok := peerInfos[pii.ID]
@@ -200,6 +247,12 @@ func connectToPeers(ctx context.Context, host host.Host, peers []string) error {
 		pi.Addrs = append(pi.Addrs, pii.Addrs...)
 	}
 
+	if len(peerInfos) == 0 {
+		return fmt.Errorf("none of the %d configured bootstrap peers is a valid address", len(peers))
+	}
+
+	var connected atomic.Int32
+
 	wg.Add(len(peerInfos))
 	for _, peerInfo := range peerInfos {
 		go func(peerInfo *peer.AddrInfo) {
@@ -207,10 +260,16 @@ func connectToPeers(ctx context.Context, host host.Host, peers []string) error {
 			err := host.Connect(ctx, *peerInfo)
 			if err != nil {
 				fmt.Printf("failed to connect to %s: %s\n", peerInfo.ID, err)
+				return
 			}
+			connected.Add(1)
 		}(peerInfo)
 	}
 	wg.Wait()
+
+	if connected.Load() == 0 {
+		return fmt.Errorf("failed to connect to any of the %d bootstrap peers", len(peerInfos))
+	}
 
 	return nil
 }
