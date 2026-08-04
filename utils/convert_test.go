@@ -31,3 +31,17 @@ func TestGetStringSlice(t *testing.T) {
 		})
 	}
 }
+
+func TestGetStringSliceCustomDelimiter(t *testing.T) {
+	got := GetStringSlice("a,b,,c", ",")
+	want := []string{"a", "b", "c"}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("GetStringSlice = %#v, want %#v", got, want)
+	}
+
+	// The default delimiter must no longer apply once one is given.
+	if got := GetStringSlice("a;b", ","); !reflect.DeepEqual(got, []string{"a;b"}) {
+		t.Errorf("GetStringSlice = %#v, want the input left whole", got)
+	}
+}
