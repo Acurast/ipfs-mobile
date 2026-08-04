@@ -1,0 +1,163 @@
+image: docker:latest
+
+variables:
+  GOOGLE_TAG: eu.gcr.io/papers-kubernetes/$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME:$CI_COMMIT_SHA
+
+stages:
+  - prepare
+  - test
+  - build
+
+prepare:
+  stage: prepare
+  script:
+    - docker build -t $GOOGLE_TAG .
+  tags:
+    - docker
+
+### Test ###
+
+# Every job runs its command in a fresh container off the prepared image, then
+# copies results out before the container is removed.
+.test:base:
+  stage: test
+  interruptible: true
+  after_script:
+    - docker rm -f $CONTAINER_TAG || true
+  tags:
+    - docker
+
+lint:
+  extends: .test:base
+  variables:
+    CONTAINER_TAG: go-lint-$CI_COMMIT_SHA
+  script:
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        # gofmt reports rather than fails, so turn its output into an exit code.
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "gofmt: the following files need formatting:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+        go vet ./...
+
+        # The live tests only compile under this tag, so vet them separately or
+        # they go unchecked until someone runs them by hand.
+        go vet -tags=integration ./...
+      '
+
+unit:
+  extends: .test:base
+  variables:
+    CONTAINER_TAG: go-unit-$CI_COMMIT_SHA
+  script:
+    # -race because this package is almost entirely concurrency; a data race here
+    # is the failure mode, not an edge case.
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        go test -v -race -count=1 -timeout 15m -coverprofile=coverage.out ./... 2>&1 \
+          | tee test.log \
+          | go-junit-report -set-exit-code > report.xml
+
+        # internal/testpeer is test-support code, driven entirely by the client
+        # and ffi suites. Go only credits a package for coverage from its own
+        # tests, so leaving it in reports it as 0% and drags the headline number
+        # from 90% down to 66%, which says nothing true about the code that ships.
+        grep -v "ipfs-mobile/internal/" coverage.out > coverage.prod.out
+        go tool cover -func=coverage.prod.out | tail -1
+      '
+  # In after_script, so a failing run still yields its report and log - which is
+  # when they are most useful. Putting these in script: meant a test failure
+  # skipped straight to container removal and the evidence went with it.
+  after_script:
+    - mkdir -p reports
+    - docker cp $CONTAINER_TAG:/app/report.xml reports/report.xml || true
+    - docker cp $CONTAINER_TAG:/app/test.log reports/test.log || true
+    - docker cp $CONTAINER_TAG:/app/coverage.out reports/coverage.out || true
+    - docker rm -f $CONTAINER_TAG || true
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - reports
+    reports:
+      junit: reports/report.xml
+
+# Live tests against the public IPFS network, behind the integration build tag.
+#
+# allow_failure because the assertions depend on third party infrastructure:
+# public bootstrap peers, DHT provider records and the cid.contact indexer. A
+# failure here is worth seeing but is as likely to mean "the network had a bad
+# day" as "this commit broke something", and that should not block a merge.
+integration:
+  extends: .test:base
+  variables:
+    CONTAINER_TAG: go-integration-$CI_COMMIT_SHA
+  allow_failure: true
+  timeout: 30m
+  script:
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        go test -tags=integration -v -count=1 -timeout 25m ./... 2>&1 \
+          | tee integration.log \
+          | go-junit-report -set-exit-code > integration-report.xml
+      '
+  after_script:
+    - mkdir -p reports
+    - docker cp $CONTAINER_TAG:/app/integration-report.xml reports/integration-report.xml || true
+    - docker cp $CONTAINER_TAG:/app/integration.log reports/integration.log || true
+    - docker rm -f $CONTAINER_TAG || true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - reports
+    reports:
+      junit: reports/integration-report.xml
+
+### Build ###
+
+# The gomobile bind and the Kotlin wrapper, which is what actually ships.
+#
+# Deliberately not optional: the bind links transports and dependencies the Go
+# tests never exercise, and has broken on its own before while the whole test
+# suite stayed green. Nothing else in this pipeline would catch that.
+android:
+  stage: build
+  interruptible: true
+  timeout: 1h
+  variables:
+    CONTAINER_TAG: android-build-$CI_COMMIT_SHA
+  script:
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        ./build_ffi android
+        cd android
+        ./gradlew --no-daemon :app:assembleRelease :app:test
+      '
+  after_script:
+    - mkdir -p artifacts
+    - docker cp $CONTAINER_TAG:/app/android/ffi/ipfs.aar artifacts/ipfs.aar || true
+    - docker cp $CONTAINER_TAG:/app/android/ffi/ipfs-sources.jar artifacts/ipfs-sources.jar || true
+    - docker cp $CONTAINER_TAG:/app/android/app/build/outputs/aar artifacts/client || true
+    - docker rm -f $CONTAINER_TAG || true
+  artifacts:
+    name: ipfs-mobile-$CI_COMMIT_SHA
+    when: always
+    expire_in: 1 week
+    paths:
+      - artifacts
+  tags:
+    - docker
