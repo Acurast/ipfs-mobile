@@ -49,6 +49,7 @@ ENV ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${NDK_VERSION}
 # go-junit-report turns `go test` output into the JUnit XML GitLab renders.
 RUN go install golang.org/x/mobile/cmd/gomobile@latest && \
     go install github.com/jstemmer/go-junit-report/v2@latest && \
+    go install golang.org/x/vuln/cmd/govulncheck@latest && \
     gomobile init
 
 ### Prepare working directory ###

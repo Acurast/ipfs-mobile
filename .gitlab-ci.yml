@@ -52,6 +52,22 @@ lint:
         # The live tests only compile under this tag, so vet them separately or
         # they go unchecked until someone runs them by hand.
         go vet -tags=integration ./...
+
+        # The published artifact is built from the Go version pinned in
+        # jitpack.yml, so a standard library advisory ships with it.
+        #
+        # govulncheck exits non-zero whenever it reports anything, so accepted
+        # findings are subtracted rather than the exit status trusted.
+        # GO-2024-3218 is DHT censorship by a Sybil adversary: no fix exists and
+        # it is inherent to using a DHT at all.
+        printf "%s\n" GO-2024-3218 | sort -u > /tmp/accepted
+        govulncheck ./... 2>&1 | grep -oE "GO-[0-9]{4}-[0-9]+" | sort -u > /tmp/found || true
+        unexpected=$(comm -23 /tmp/found /tmp/accepted)
+        if [ -n "$unexpected" ]; then
+          echo "govulncheck reported findings that are not on the accepted list:"
+          echo "$unexpected"
+          exit 1
+        fi
       '
 
 unit:

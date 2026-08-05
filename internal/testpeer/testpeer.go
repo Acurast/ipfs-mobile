@@ -26,17 +26,21 @@ import (
 	chunker "github.com/ipfs/boxo/chunker"
 	offline "github.com/ipfs/boxo/exchange/offline"
 	"github.com/ipfs/boxo/ipld/merkledag"
+	"github.com/ipfs/boxo/ipld/unixfs"
 	"github.com/ipfs/boxo/ipld/unixfs/importer/balanced"
 	importer "github.com/ipfs/boxo/ipld/unixfs/importer/helpers"
+	pb "github.com/ipfs/boxo/ipld/unixfs/pb"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	format "github.com/ipfs/go-ipld-format"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	multihash "github.com/multiformats/go-multihash"
+	"google.golang.org/protobuf/proto"
 )
 
 // UnreachableCID is well formed but served by nobody, so a download of it blocks
@@ -368,4 +372,131 @@ func addUnixfsFile(t *testing.T, store blockstore.Blockstore, content []byte) ci
 	}
 
 	return node.Cid()
+}
+
+// ServeSymlink serves a DAG whose root is a UnixFS symlink pointing at target.
+func ServeSymlink(t *testing.T, target string) (addr string, root string) {
+	t.Helper()
+
+	symlink := unixfsSymlink(t, target)
+
+	return serveNodes(t, symlink.Cid(), symlink), symlink.Cid().String()
+}
+
+// ServeDirectoryWithSymlink serves a directory holding one regular file and one
+// symlink pointing at target.
+func ServeDirectoryWithSymlink(t *testing.T, target string) (addr string, root string) {
+	t.Helper()
+
+	symlink := unixfsSymlink(t, target)
+
+	contents := merkledag.NodeWithData(unixfsBytes(t, pb.Data_File, []byte("harmless")))
+
+	dirNode := unixfs.EmptyDirNode()
+	if err := dirNode.AddNodeLink("harmless.txt", contents); err != nil {
+		t.Fatal(err)
+	}
+	if err := dirNode.AddNodeLink("link", symlink); err != nil {
+		t.Fatal(err)
+	}
+
+	return serveNodes(t, dirNode.Cid(), dirNode, contents, symlink), dirNode.Cid().String()
+}
+
+// ServeUnderdeclaredFile serves a file DAG that declares `declared` bytes while
+// linking `leaves` raw leaves of `leafSize` bytes each. Nothing in UnixFS
+// reconciles the two.
+func ServeUnderdeclaredFile(t *testing.T, declared uint64, leaves int, leafSize int) (addr string, root string) {
+	t.Helper()
+
+	fsnode := unixfs.NewFSNode(pb.Data_File)
+
+	nodes := make([]format.Node, 0, leaves+1)
+	rootNode := merkledag.NodeWithData(nil)
+
+	for i := range leaves {
+		leaf := merkledag.NewRawNode(bytes.Repeat([]byte{byte('a' + i%26)}, leafSize))
+		nodes = append(nodes, leaf)
+
+		if err := rootNode.AddNodeLink("", leaf); err != nil {
+			t.Fatal(err)
+		}
+		fsnode.AddBlockSize(uint64(leafSize))
+	}
+
+	encoded, err := fsnode.GetBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewrite the declared filesize after the blocksizes are in place, so the
+	// root disagrees with its own leaves.
+	encoded = withDeclaredFileSize(t, encoded, declared)
+	rootNode.SetData(encoded)
+
+	nodes = append(nodes, rootNode)
+
+	return serveNodes(t, rootNode.Cid(), nodes...), rootNode.Cid().String()
+}
+
+func unixfsSymlink(t *testing.T, target string) format.Node {
+	t.Helper()
+
+	return merkledag.NodeWithData(unixfsBytes(t, pb.Data_Symlink, []byte(target)))
+}
+
+func unixfsBytes(t *testing.T, kind pb.Data_DataType, data []byte) []byte {
+	t.Helper()
+
+	fsnode := unixfs.NewFSNode(kind)
+	fsnode.SetData(data)
+
+	encoded, err := fsnode.GetBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return encoded
+}
+
+// withDeclaredFileSize re-encodes the unixfs protobuf with filesize replaced.
+func withDeclaredFileSize(t *testing.T, encoded []byte, size uint64) []byte {
+	t.Helper()
+
+	var data pb.Data
+	if err := proto.Unmarshal(encoded, &data); err != nil {
+		t.Fatal(err)
+	}
+
+	data.Filesize = &size
+
+	rewritten, err := proto.Marshal(&data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return rewritten
+}
+
+// serveNodes starts a peer whose blockstore holds exactly nodes.
+func serveNodes(t *testing.T, root cid.Cid, nodes ...format.Node) (addr string) {
+	t.Helper()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	host, _ := startPeer(t)
+
+	store := blockstore.NewBlockstore(dssync.MutexWrap(datastore.NewMapDatastore()))
+	for _, node := range nodes {
+		if err := store.Put(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	network := bsnet.NewFromIpfsHost(host)
+	server := bitswap.New(ctx, network, nil, store)
+	t.Cleanup(func() { server.Close() })
+
+	return peerAddr(t, host)
 }

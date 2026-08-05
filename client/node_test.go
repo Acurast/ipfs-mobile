@@ -5,6 +5,7 @@ import (
 	"ipfs-mobile/internal/testpeer"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -155,5 +156,61 @@ func TestDownloadLeavesNoScratchDirectories(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), ".ipfs-download-") {
 			t.Errorf("scratch directory %q was left behind", entry.Name())
 		}
+	}
+}
+
+// With no gateways configured there is no HTTP exchange at all, so an address
+// discovered through content routing cannot become an HTTP GET. That is the
+// deployed shape today, and it is where the egress exposure would otherwise be.
+func TestWithoutGatewaysThereIsNoHTTPExchange(t *testing.T) {
+	addr, root := testpeer.Serve(t, testpeer.Content(1024))
+
+	client := newClient(t, &Config{BootstrapPeers: []string{addr}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := client.Get(ctx, root, filepath.Join(t.TempDir(), "out"), -1); err != nil {
+		t.Fatalf("libp2p-only retrieval failed: %v", err)
+	}
+
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+
+	if client.node.http != nil {
+		t.Error("an HTTP exchange was started with no gateways configured")
+	}
+}
+
+// Configured gateways do get an HTTP exchange, held to their hosts.
+//
+// The allowlist itself is only assertable through configuration here: httpnet
+// filters on hostname, and every httptest server shares 127.0.0.1, so a rogue
+// host cannot be told apart from a legitimate one on loopback.
+func TestConfiguredGatewaysFormTheHTTPAllowlist(t *testing.T) {
+	gateway, root, _ := testpeer.ServeTrustlessGateway(t, testpeer.Content(1024))
+
+	client := newClient(t, &Config{
+		Gateways:   []string{gateway, "https://ipfs.io", "https://dweb.link"},
+		DisableDHT: true,
+	})
+
+	want := []string{"127.0.0.1", "ipfs.io", "dweb.link"}
+	if got := client.config.gatewayHosts; !slices.Equal(got, want) {
+		t.Errorf("gatewayHosts = %v, want %v", got, want)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := client.Get(ctx, root, filepath.Join(t.TempDir(), "out"), -1); err != nil {
+		t.Fatalf("retrieval through an allowlisted gateway failed: %v", err)
+	}
+
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+
+	if client.node.http == nil {
+		t.Error("no HTTP exchange despite configured gateways")
 	}
 }

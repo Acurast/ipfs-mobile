@@ -16,8 +16,9 @@ import (
 // A gateway has no libp2p identity, so its ID is synthesised from the URL and
 // used purely as a map key. Nothing trusts it: what makes an anonymous endpoint
 // safe to fetch from is hashing each block against the CID that asked for it.
-func parseGateways(gateways []string) ([]peer.AddrInfo, error) {
+func parseGateways(gateways []string) ([]peer.AddrInfo, []string, error) {
 	peers := make([]peer.AddrInfo, 0, len(gateways))
+	hosts := make([]string, 0, len(gateways))
 
 	for _, gateway := range gateways {
 		addr, err := gatewayMultiaddr(gateway)
@@ -32,14 +33,21 @@ func parseGateways(gateways []string) ([]peer.AddrInfo, error) {
 			continue
 		}
 
+		parsed, err := url.Parse(gateway)
+		if err != nil {
+			fmt.Printf("skipping invalid gateway %q: %s\n", gateway, err)
+			continue
+		}
+
 		peers = append(peers, peer.AddrInfo{ID: id, Addrs: []multiaddr.Multiaddr{addr}})
+		hosts = append(hosts, parsed.Hostname())
 	}
 
 	if len(gateways) > 0 && len(peers) == 0 {
-		return nil, fmt.Errorf("none of the %d configured gateways is a valid URL", len(gateways))
+		return nil, nil, fmt.Errorf("none of the %d configured gateways is a valid URL", len(gateways))
 	}
 
-	return peers, nil
+	return peers, hosts, nil
 }
 
 // gatewayMultiaddr renders a gateway URL as the exchange expects it, for

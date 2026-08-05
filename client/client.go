@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ipfs/go-cid"
+
 	"ipfs-mobile/utils"
 )
 
@@ -93,16 +95,17 @@ func New(config *Config) (*Client, error) {
 		return nil, err
 	}
 
-	gateways, err := parseGateways(config.Gateways)
+	gateways, gatewayHosts, err := parseGateways(config.Gateways)
 	if err != nil {
 		return nil, err
 	}
 
 	node := nodeConfig{
-		port:       config.Port,
-		peers:      peers,
-		disableDHT: config.DisableDHT,
-		gateways:   gateways,
+		port:         config.Port,
+		peers:        peers,
+		disableDHT:   config.DisableDHT,
+		gateways:     gateways,
+		gatewayHosts: gatewayHosts,
 	}
 
 	if config.DelegatedRoutingEndpoint != "" {
@@ -146,11 +149,19 @@ func orDefault(configured time.Duration, fallback time.Duration) time.Duration {
 // does it fall back to an unverified gateway fetch.
 //
 // On success output is replaced, whether or not something was already there.
-func (client *Client) Get(ctx context.Context, cid string, output string, sizeLimit int64) error {
+func (client *Client) Get(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
+	// Parsed before either path runs, and passed down as a value from here on.
+	// Both paths derive a filesystem path or a URL from it, and neither is safe
+	// to build from an unvalidated caller string.
+	parsed, err := cid.Parse(cidStr)
+	if err != nil {
+		return fmt.Errorf("invalid cid %q: %w", cidStr, err)
+	}
+
 	primary, cancel := client.primaryDeadline(ctx)
 	defer cancel()
 
-	err := client.getPrimary(primary, cid, output, sizeLimit)
+	err = client.getPrimary(primary, parsed, output, sizeLimit)
 	if err == nil {
 		return nil
 	}
@@ -176,9 +187,9 @@ func (client *Client) Get(ctx context.Context, cid string, output string, sizeLi
 		return err
 	}
 
-	fmt.Printf("primary retrieval of %s failed (%s), trying gateways unverified\n", cid, err)
+	fmt.Printf("primary retrieval of %s failed (%s), trying gateways unverified\n", parsed, err)
 
-	fallbackErr := client.fetchFromGateways(ctx, cid, output, sizeLimit)
+	fallbackErr := client.fetchFromGateways(ctx, parsed, output, sizeLimit)
 	if fallbackErr == nil {
 		return nil
 	}
@@ -220,7 +231,7 @@ func (client *Client) primaryDeadline(ctx context.Context) (context.Context, con
 
 // getPrimary fetches over the block exchange, where every block is checked
 // against the CID that asked for it.
-func (client *Client) getPrimary(ctx context.Context, cid string, output string, sizeLimit int64) error {
+func (client *Client) getPrimary(ctx context.Context, target cid.Cid, output string, sizeLimit int64) error {
 	result := make(chan error, 1)
 
 	// Started on its own goroutine so the select below returns at the deadline
@@ -234,7 +245,7 @@ func (client *Client) getPrimary(ctx context.Context, cid string, output string,
 		}
 		defer client.release()
 
-		result <- node.download(ctx, cid, output, sizeLimit)
+		result <- node.download(ctx, target, output, sizeLimit)
 	}()
 
 	select {

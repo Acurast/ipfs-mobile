@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/ipfs/go-cid"
 )
 
 const gatewayScratchPrefix = ".ipfs-gateway-"
@@ -33,7 +35,7 @@ func (err *SizeLimitError) Error() string {
 // NOT verified, unlike every other path here. A gateway response cannot be
 // checked against its CID, which commits to a DAG rather than to bytes, so this
 // content is trusted because the gateway served it.
-func (client *Client) fetchFromGateways(ctx context.Context, cid string, output string, sizeLimit int64) error {
+func (client *Client) fetchFromGateways(ctx context.Context, target cid.Cid, output string, sizeLimit int64) error {
 	if len(client.gateways) == 0 {
 		return fmt.Errorf("no gateways configured")
 	}
@@ -42,7 +44,7 @@ func (client *Client) fetchFromGateways(ctx context.Context, cid string, output 
 
 	for _, gateway := range client.gateways {
 		attempt, cancel := context.WithTimeout(ctx, client.fallbackStepTimeout)
-		err := fetchFromGateway(attempt, gateway, cid, output, sizeLimit)
+		err := fetchFromGateway(attempt, gateway, target, output, sizeLimit)
 		cancel()
 
 		if err == nil {
@@ -70,13 +72,15 @@ func (client *Client) fetchFromGateways(ctx context.Context, cid string, output 
 // A plain GET of a directory CID returns the gateway's HTML index page, which
 // would be written out as though it were the content. Tar carries the file or
 // directory tree itself, so what lands at output has the right shape.
-func fetchFromGateway(ctx context.Context, gateway string, cid string, output string, sizeLimit int64) error {
-	target, err := url.JoinPath(gateway, "ipfs", cid)
+func fetchFromGateway(ctx context.Context, gateway string, target cid.Cid, output string, sizeLimit int64) error {
+	// The canonical CID string, never the caller's: it is about to become a URL
+	// path segment.
+	endpoint, err := url.JoinPath(gateway, "ipfs", target.String())
 	if err != nil {
 		return err
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target+"?format=tar", nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"?format=tar", nil)
 	if err != nil {
 		return err
 	}
@@ -112,7 +116,7 @@ func fetchFromGateway(ctx context.Context, gateway string, cid string, output st
 		return err
 	}
 
-	fmt.Printf("fetched %s from gateway %s unverified (%d bytes)\n", cid, gateway, written)
+	fmt.Printf("fetched %s from gateway %s unverified (%d bytes)\n", target, gateway, written)
 
 	if err := os.RemoveAll(output); err != nil {
 		return err
@@ -210,7 +214,9 @@ func resolveTarPath(dir string, name string) (path string, top string, err error
 // on the bytes that arrive, since Content-Length may be absent or wrong. A
 // negative limit means unlimited.
 func writeLimited(path string, body io.Reader, sizeLimit int64) (int64, error) {
-	file, err := os.Create(path)
+	// O_EXCL so an existing entry - including a symlink planted by an earlier
+	// entry in the same archive - is never opened or followed.
+	file, err := os.OpenFile(path, os.O_EXCL|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return 0, err
 	}

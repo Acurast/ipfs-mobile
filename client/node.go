@@ -57,7 +57,12 @@ type nodeConfig struct {
 	disableDHT bool
 
 	// gateways are asked at the same time as libp2p peers, not after them.
-	gateways  []peer.AddrInfo
+	gateways []peer.AddrInfo
+
+	// gatewayHosts are the hosts of gateways, which is the allowlist the HTTP
+	// exchange is held to.
+	gatewayHosts []string
+
 	delegated routing.ContentDiscovery
 }
 
@@ -92,7 +97,23 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 
 	// One exchange over two transports, so a gateway and a libp2p peer are both
 	// just peers that might have the block.
-	node.http = httpnet.New(host, httpnet.WithUserAgent(userAgent))
+	// Only the configured gateways may be reached over HTTP. Content routing hands
+	// back addresses chosen by whoever answered the lookup, and an HTTP address
+	// becomes a GET - so without this a hostile provider record turns the device
+	// into a probe against its own network. Blocks are hashed either way, so the
+	// exposure is egress rather than content, but the library already knows which
+	// HTTP hosts are legitimate and there is no reason to talk to others.
+	//
+	// With no gateways configured there is nothing to allow, so the HTTP half is
+	// left out entirely and the router runs bitswap alone.
+	if len(config.gatewayHosts) > 0 {
+		node.http = httpnet.New(
+			host,
+			httpnet.WithUserAgent(userAgent),
+			httpnet.WithAllowlist(config.gatewayHosts),
+		)
+	}
+
 	node.exchange = network.New(host.Peerstore(), bsnet.NewFromIpfsHost(host), node.http)
 
 	node.bs = bsclient.New(
@@ -153,17 +174,12 @@ func (node *node) bootstrapDHT(ctx context.Context) {
 	}
 }
 
-func (node *node) download(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
-	parsed, err := cid.Parse(cidStr)
-	if err != nil {
-		return fmt.Errorf("invalid cid %q: %w", cidStr, err)
-	}
-
+func (node *node) download(ctx context.Context, target cid.Cid, output string, sizeLimit int64) error {
 	bserv := blockservice.New(blockstore.NewBlockstore(datastore.NewNullDatastore()), node.bs)
 	session := merkledag.NewSession(ctx, merkledag.NewDAGService(bserv))
 	dserv := merkledag.NewReadOnlyDagService(session)
 
-	nd, err := dserv.Get(ctx, parsed)
+	nd, err := dserv.Get(ctx, target)
 	if err != nil {
 		return err
 	}
@@ -173,6 +189,8 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 		return err
 	}
 
+	// A hint only, and cheap: the DAG author writes this figure and nothing
+	// reconciles it with the leaves it links. Enforcement is on bytes written.
 	if sizeLimit > 0 {
 		size, err := unixfsnd.Size()
 		if err != nil {
@@ -196,7 +214,7 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 	defer os.RemoveAll(scratch)
 
 	staged := filepath.Join(scratch, "data")
-	if err := files.WriteTo(unixfsnd, staged); err != nil {
+	if _, err := materialise(unixfsnd, staged, sizeLimit, 0); err != nil {
 		return err
 	}
 
@@ -245,6 +263,63 @@ func sweepScratchPrefix(dir string, prefix string) {
 
 		os.RemoveAll(filepath.Join(dir, entry.Name()))
 	}
+}
+
+// materialise writes nd at path and returns how many content bytes it wrote.
+//
+// Deliberately not files.WriteTo, which reproduces the DAG faithfully - and a
+// DAG is richer than a byte string. It can hold a symlink, whose target the DAG
+// author chooses and which os.Symlink would write verbatim, so a caller that
+// reads the result reads a file of the author's choosing instead. It can also
+// declare any size it likes, so the limit has to hold against arriving bytes.
+//
+// Only regular files and directories are written; anything else is refused.
+func materialise(nd files.Node, path string, sizeLimit int64, written int64) (int64, error) {
+	switch node := nd.(type) {
+	// Ahead of files.File, which a Symlink also satisfies.
+	case *files.Symlink:
+		return written, fmt.Errorf("refusing to write a symlink at %q", filepath.Base(path))
+
+	case files.File:
+		remaining := int64(-1)
+		if sizeLimit > 0 {
+			remaining = sizeLimit - written
+		}
+
+		count, err := writeLimited(path, node, remaining)
+
+		return written + count, err
+
+	case files.Directory:
+		if err := os.Mkdir(path, 0o755); err != nil {
+			return written, err
+		}
+
+		entries := node.Entries()
+		for entries.Next() {
+			name := entries.Name()
+			if !validEntryName(name) {
+				return written, fmt.Errorf("invalid directory entry name %q", name)
+			}
+
+			var err error
+			written, err = materialise(entries.Node(), filepath.Join(path, name), sizeLimit, written)
+			if err != nil {
+				return written, err
+			}
+		}
+
+		return written, entries.Err()
+
+	default:
+		return written, fmt.Errorf("unsupported unixfs node type %T", nd)
+	}
+}
+
+// validEntryName refuses names that would place an entry outside the directory
+// being written.
+func validEntryName(name string) bool {
+	return name != "" && name != "." && name != ".." && !strings.ContainsAny(name, "/\x00")
 }
 
 // close tolerates a partially built node, which is how startNode unwinds.
