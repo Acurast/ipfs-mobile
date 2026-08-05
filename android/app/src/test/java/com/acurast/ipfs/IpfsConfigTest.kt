@@ -1,0 +1,52 @@
+package com.acurast.ipfs
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Test
+import kotlin.time.Duration.Companion.seconds
+
+/**
+ * Construction only: the node, and so the native library, is not touched until
+ * the first download.
+ */
+class IpfsConfigTest {
+
+    /** The shape existing callers use, kept working by the secondary constructor. */
+    @Test
+    fun bootstrapNodesOnly() {
+        Ipfs(bootstrapNodes = listOf("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"))
+    }
+
+    @Test
+    fun groupedConfiguration() {
+        Ipfs(
+            routing = Ipfs.Routing(
+                bootstrapNodes = listOf("/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN"),
+                delegated = "https://cid.contact",
+            ),
+            gateways = Ipfs.Gateways(
+                urls = listOf("https://ipfs.io"),
+                allowUnverifiedFallback = true,
+            ),
+            timeouts = Ipfs.Timeouts(
+                idle = 30.seconds,
+                primary = 10.seconds,
+                fallbackStep = 5.seconds,
+            ),
+        )
+    }
+
+    @Test
+    fun defaultsAreConservative() {
+        assertEquals(30.seconds, Ipfs.Timeouts().idle)
+
+        // Both defer to the client's own bound rather than inventing one here.
+        assertNull(Ipfs.Timeouts().primary)
+        assertNull(Ipfs.Timeouts().fallbackStep)
+
+        // Unverified content is opt in, and no endpoint is contacted unless named.
+        assertFalse(Ipfs.Gateways().allowUnverifiedFallback)
+        assertNull(Ipfs.Routing().delegated)
+    }
+}

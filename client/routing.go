@@ -15,13 +15,24 @@ import (
 
 const userAgent = "ipfs-mobile"
 
+// Matches boxo's own default cap on a delegated routing response.
+const delegatedResponseLimit = 1 << 20
+
 // newDelegatedRouter builds a content router backed by a delegated routing v1
 // endpoint, which finds content that is indexed but never announced to the DHT.
 func newDelegatedRouter(endpoint string) (routing.ContentDiscovery, error) {
 	delegated, err := routinghttp.New(
 		endpoint,
+		// Wraps boxo's own transport rather than replacing it, so the response-body
+		// cap survives: an indexer must not be able to stream unbounded data into a
+		// phone. Must precede WithUserAgent, which edits whichever client is set.
+		routinghttp.WithHTTPClient(&http.Client{
+			Transport: &routinghttp.ResponseBodyLimitedTransport{
+				RoundTripper: jsonOnlyTransport{},
+				LimitBytes:   delegatedResponseLimit,
+			},
+		}),
 		routinghttp.WithUserAgent(userAgent),
-		routinghttp.WithHTTPClient(&http.Client{Transport: jsonOnlyTransport{}}),
 		// Wider than boxo's default, which keeps only bitswap peers. Indexers
 		// return HTTP gateways for the same content and the exchange can use them.
 		routinghttp.WithProtocolFilter([]string{

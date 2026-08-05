@@ -100,9 +100,20 @@ function bind_ios () {
 
     go get golang.org/x/mobile
 
-    gomobile bind -o $CURR_DIR/IPFS.xcframework -target=ios $CURR_DIR/ffi
+    echo "  [ios]"
+    if gomobile bind -o $CURR_DIR/IPFS.xcframework -target=ios -trimpath -ldflags="$LDFLAGS" $CURR_DIR/ffi; then
+        echo -e "    \xE2\x9C\x94 ios"
+    else
+        echo -e "    \xE2\x9C\x97 ios"
+        ERROR="gomobile bind failed for ios"
+    fi
 
     go mod tidy
+
+    if [[ -n "${ERROR}" ]]; then
+        echo "Error: $ERROR."
+        exit 1
+    fi
 }
 
 # Validate platform argument

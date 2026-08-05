@@ -10,35 +10,84 @@ import java.io.IOException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 import ffi.Client as FfiClient
+import ffi.ClientConfig
 
 /**
  * A reusable IPFS client, safe to share between coroutines. The node is started
- * on the first download and reused by later ones.
- *
- * [idleTimeout] shuts the node down once it has been unused for that long,
- * restarting it on the next download; `null` keeps it up until [close].
- *
- * [delegatedRouting] queries a delegated routing v1 endpoint such as
- * `https://cid.contact` alongside the DHT. It finds content that is indexed but
- * never announced to the DHT; in exchange the endpoint learns which CIDs this
- * device fetches. Off by default.
- *
- * [gateways] are HTTP gateways fetched from alongside libp2p peers and verified
- * like any other source.
- *
- * [allowUnverifiedGatewayFallback] permits a whole-file fetch from those
- * gateways once every verified route has failed. Such a response cannot be
- * checked against its CID and is trusted because the gateway served it. Enable
- * it when unverified content still beats none.
+ * on the first download and reused by later ones, and [close] releases it.
  */
 public class Ipfs(
-    private val bootstrapNodes: List<String> = emptyList(),
+    private val routing: Routing = Routing(),
+    private val gateways: Gateways = Gateways(),
+    private val timeouts: Timeouts = Timeouts(),
     private val port: Int = PORT,
-    private val idleTimeout: Duration? = IDLE_TIMEOUT,
-    private val delegatedRouting: String? = null,
-    private val gateways: List<String> = emptyList(),
-    private val allowUnverifiedGatewayFallback: Boolean = false,
 ) : Closeable {
+
+    /** Bootstrap peers alone, which is the common case. */
+    public constructor(bootstrapNodes: List<String>) : this(routing = Routing(bootstrapNodes))
+
+    /** How content is located. */
+    public data class Routing(
+        /** Peers dialled to join the network. */
+        val bootstrapNodes: List<String> = emptyList(),
+
+        /**
+         * A delegated routing v1 endpoint such as `https://cid.contact`, queried
+         * alongside the DHT. It finds content that is indexed but never announced
+         * to the DHT; in exchange the endpoint learns which CIDs this device
+         * fetches. `null` disables it.
+         */
+        val delegated: String? = null,
+    )
+
+    /** HTTP gateways, and how far to trust them. */
+    public data class Gateways(
+        /**
+         * Gateway URLs, for example `https://ipfs.io`, fetched from alongside
+         * libp2p peers and verified like any other source.
+         */
+        val urls: List<String> = emptyList(),
+
+        /**
+         * Permits a whole-file fetch from [urls] once every verified route has
+         * failed. Such a response cannot be checked against its CID and is trusted
+         * because the gateway served it. Enable it when unverified content still
+         * beats none.
+         */
+        val allowUnverifiedFallback: Boolean = false,
+    )
+
+    /** Bounds on how long the client spends before giving up. */
+    public data class Timeouts(
+        /**
+         * Shuts the node down once it has been unused for this long, restarting it
+         * on the next download. `null` keeps it up until [close].
+         */
+        val idle: Duration? = DEFAULT_IDLE,
+
+        /**
+         * The most the primary phase - peers and gateways, every block verified -
+         * may take before [Gateways.allowUnverifiedFallback] is allowed to start.
+         * A download's own timeout shortens this but cannot extend it, so some of
+         * that timeout always survives for the fallback. `null` uses 15s.
+         */
+        val primary: Duration? = null,
+
+        /**
+         * The most any single gateway attempt in the fallback may take. Per
+         * attempt rather than per phase, so dead gateways cannot starve the one
+         * that would have answered. `null` uses 15s.
+         */
+        val fallbackStep: Duration? = null,
+    ) {
+        public companion object {
+            /**
+             * Long enough that a burst of downloads reuses one set of connections,
+             * short enough that an idle app stops holding sockets open.
+             */
+            private val DEFAULT_IDLE: Duration = 30.seconds
+        }
+    }
 
     // A monitor rather than a coroutine Mutex: close() overrides
     // Closeable.close() and so cannot suspend, yet it guards the same state
@@ -97,12 +146,16 @@ public class Ipfs(
         // Only validates the configured lists; the node comes up on the first
         // download.
         client ?: Ffi.newClient(
-            bootstrapNodes.joinToString(DELIMITER_LIST_STRING),
-            port,
-            idleTimeout?.inWholeMilliseconds ?: NO_TIMEOUT,
-            delegatedRouting ?: NO_DELEGATED_ROUTING,
-            gateways.joinToString(DELIMITER_LIST_STRING),
-            allowUnverifiedGatewayFallback,
+            ClientConfig().also {
+                it.bootstrapPeers = routing.bootstrapNodes.joinToString(DELIMITER_LIST_STRING)
+                it.delegatedRouting = routing.delegated ?: NO_DELEGATED_ROUTING
+                it.gateways = gateways.urls.joinToString(DELIMITER_LIST_STRING)
+                it.allowUnverifiedGatewayFallback = gateways.allowUnverifiedFallback
+                it.idleTimeout = timeouts.idle?.inWholeMilliseconds ?: NO_TIMEOUT
+                it.primaryTimeout = timeouts.primary?.inWholeMilliseconds ?: USE_DEFAULT
+                it.fallbackStepTimeout = timeouts.fallbackStep?.inWholeMilliseconds ?: USE_DEFAULT
+                it.port = port
+            },
         ).also { client = it }
     }
 
@@ -122,16 +175,13 @@ public class Ipfs(
     public companion object {
         private const val PORT = 0
 
-        /**
-         * Long enough that a burst of downloads reuses one set of connections,
-         * short enough that an idle app stops holding sockets open.
-         */
-        private val IDLE_TIMEOUT: Duration = 30.seconds
-
         /** The FFI encodes "no limit" and "no timeout" as negative, "no endpoint" as empty. */
         private const val NO_SIZE_LIMIT = -1L
         private const val NO_TIMEOUT = -1L
         private const val NO_DELEGATED_ROUTING = ""
+
+        /** ...and defers to the client's own default on a non-positive duration. */
+        private const val USE_DEFAULT = 0L
 
         private const val DIR_IPFS = "ipfs"
         private const val DIR_DATA = "data"

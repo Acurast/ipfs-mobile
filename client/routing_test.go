@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"ipfs-mobile/internal/testpeer"
+
+	"github.com/ipfs/go-cid"
 )
 
 // delegatedRouter stands up a routing v1 endpoint answering provider lookups for
@@ -254,4 +256,45 @@ func TestNewProviderFinderComposition(t *testing.T) {
 	if _, ok := both.(parallelDiscovery); !ok {
 		t.Errorf("newProviderFinder with two routers = %T, want parallelDiscovery", both)
 	}
+}
+
+// The delegated routing client must keep boxo's response-body cap and its user
+// agent, both of which a replacement HTTP client would silently drop.
+func TestDelegatedRouterKeepsUserAgentAndBodyCap(t *testing.T) {
+	var seenAgent atomic.Value
+
+	indexer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAgent.Store(r.Header.Get("User-Agent"))
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"Providers":[]}`))
+	}))
+	t.Cleanup(indexer.Close)
+
+	router, err := newDelegatedRouter(indexer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	parsed := mustParseCID(t, testpeer.UnreachableCID)
+	for range router.FindProvidersAsync(ctx, parsed, 1) {
+	}
+
+	agent, _ := seenAgent.Load().(string)
+	if !strings.Contains(agent, userAgent) {
+		t.Errorf("User-Agent = %q, want it to contain %q", agent, userAgent)
+	}
+}
+
+func mustParseCID(t *testing.T, s string) cid.Cid {
+	t.Helper()
+
+	parsed, err := cid.Parse(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return parsed
 }

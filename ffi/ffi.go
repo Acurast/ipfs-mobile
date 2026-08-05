@@ -8,6 +8,46 @@ import (
 	"ipfs-mobile/utils"
 )
 
+// ClientConfig configures a reusable Client.
+//
+// A struct rather than parameters because gomobile can only carry strings, sized
+// integers and booleans, so every option would otherwise be another positional
+// argument at the call site.
+//
+// bootstrapPeers and gateways are ";" separated lists. Durations are in
+// milliseconds, and zero or negative selects the documented default.
+type ClientConfig struct {
+	BootstrapPeers string
+	Port           int32
+	Gateways       string
+
+	// DelegatedRouting is a delegated routing v1 endpoint such as
+	// "https://cid.contact", queried alongside the DHT. It finds content that is
+	// indexed but never announced to the DHT; in exchange the endpoint learns
+	// which CIDs are fetched. Empty disables it.
+	DelegatedRouting string
+
+	// IdleTimeout closes the node once it has gone that long without a download;
+	// the next one starts a new node. Zero or negative keeps it up until Close,
+	// which must be called either way.
+	IdleTimeout int64
+
+	// AllowUnverifiedGatewayFallback permits a gateway fetch once every verified
+	// route has failed. That content cannot be checked against its CID and is
+	// trusted because the gateway served it.
+	AllowUnverifiedGatewayFallback bool
+
+	// PrimaryTimeout is the most the primary phase may take before the fallback
+	// above is allowed to start. A download's own timeout shortens it but cannot
+	// extend it, so some of that timeout always survives for the fallback.
+	PrimaryTimeout int64
+
+	// FallbackStepTimeout is the most any single gateway attempt may take. Per
+	// attempt rather than per phase, so dead gateways cannot starve the one that
+	// would have answered.
+	FallbackStepTimeout int64
+}
+
 // Config configures a one-shot Get.
 type Config struct {
 	BootstrapPeers string
@@ -15,13 +55,24 @@ type Config struct {
 	SizeLimit      int64
 	Timeout        int64
 
-	// DelegatedRouting is the optional delegated routing v1 endpoint described
-	// on NewClient. Empty disables it.
-	DelegatedRouting string
-
-	// Gateways and AllowUnverifiedGatewayFallback are as described on NewClient.
+	// As described on ClientConfig.
+	DelegatedRouting               string
 	Gateways                       string
 	AllowUnverifiedGatewayFallback bool
+	PrimaryTimeout                 int64
+	FallbackStepTimeout            int64
+}
+
+func (config *Config) clientConfig() *ClientConfig {
+	return &ClientConfig{
+		BootstrapPeers:                 config.BootstrapPeers,
+		Port:                           config.Port,
+		Gateways:                       config.Gateways,
+		DelegatedRouting:               config.DelegatedRouting,
+		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,
+		PrimaryTimeout:                 config.PrimaryTimeout,
+		FallbackStepTimeout:            config.FallbackStepTimeout,
+	}
 }
 
 // Client is a reusable handle over a running IPFS node.
@@ -32,39 +83,17 @@ type Client struct {
 	inner *client.Client
 }
 
-// NewClient builds a Client. bootstrapPeers is a ";" separated list of
-// multiaddrs. A port of 0 picks a free one.
-//
-// idleTimeout, in milliseconds, closes the node once it has gone that long
-// without a download; the next one starts a new node. Zero or negative keeps it
-// up until Close, which must be called either way.
-//
-// delegatedRouting is a delegated routing v1 endpoint such as
-// "https://cid.contact", queried alongside the DHT. It finds content that is
-// indexed but never announced to the DHT; in exchange the endpoint learns which
-// CIDs are fetched. Empty disables it.
-//
-// gateways is a ";" separated list of HTTP gateway URLs, fetched from alongside
-// libp2p peers and verified like any other source.
-//
-// allowUnverifiedGatewayFallback permits a whole-file fetch from those gateways
-// once every verified route has failed. That content cannot be checked against
-// its CID and is trusted because the gateway served it.
-func NewClient(
-	bootstrapPeers string,
-	port int32,
-	idleTimeout int64,
-	delegatedRouting string,
-	gateways string,
-	allowUnverifiedGatewayFallback bool,
-) (*Client, error) {
+// NewClient builds a Client. Close must be called when it is no longer needed.
+func NewClient(config *ClientConfig) (*Client, error) {
 	inner, err := client.New(&client.Config{
-		BootstrapPeers:                 utils.GetStringSlice(bootstrapPeers),
-		Port:                           port,
-		IdleTimeout:                    time.Duration(idleTimeout) * time.Millisecond,
-		DelegatedRoutingEndpoint:       delegatedRouting,
-		Gateways:                       utils.GetStringSlice(gateways),
-		AllowUnverifiedGatewayFallback: allowUnverifiedGatewayFallback,
+		BootstrapPeers:                 utils.GetStringSlice(config.BootstrapPeers),
+		Port:                           config.Port,
+		Gateways:                       utils.GetStringSlice(config.Gateways),
+		DelegatedRoutingEndpoint:       config.DelegatedRouting,
+		IdleTimeout:                    milliseconds(config.IdleTimeout),
+		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,
+		PrimaryTimeout:                 milliseconds(config.PrimaryTimeout),
+		FallbackStepTimeout:            milliseconds(config.FallbackStepTimeout),
 	})
 	if err != nil {
 		return nil, err
@@ -90,14 +119,7 @@ func (client *Client) Close() error {
 // Get downloads a single CID through a Client created and closed around the
 // call. Prefer NewClient when fetching more than once.
 func Get(cid string, output string, config *Config) error {
-	client, err := NewClient(
-		config.BootstrapPeers,
-		config.Port,
-		0,
-		config.DelegatedRouting,
-		config.Gateways,
-		config.AllowUnverifiedGatewayFallback,
-	)
+	client, err := NewClient(config.clientConfig())
 	if err != nil {
 		return err
 	}
@@ -112,4 +134,14 @@ func withTimeout(timeout int64) (context.Context, context.CancelFunc) {
 	}
 
 	return context.WithTimeout(context.Background(), time.Duration(timeout)*time.Millisecond)
+}
+
+// milliseconds converts an FFI duration, leaving a non-positive value alone so
+// the client applies its own default.
+func milliseconds(value int64) time.Duration {
+	if value <= 0 {
+		return 0
+	}
+
+	return time.Duration(value) * time.Millisecond
 }

@@ -7,6 +7,7 @@
 package testpeer
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
@@ -161,9 +162,9 @@ func ServeTrustlessGateway(t *testing.T, content []byte) (gatewayURL string, roo
 	return server.URL, rootCid.String(), blockRequests
 }
 
-// ServeWholeFileGateway starts an HTTP gateway that serves complete files and
-// refuses block requests, as a gateway without trustless support does. servedBody
-// may deliberately not match the CID.
+// ServeWholeFileGateway starts an HTTP gateway that serves content as a tar
+// archive but refuses block requests, which is how a gateway without trustless
+// support behaves. servedBody may deliberately not match the CID.
 func ServeWholeFileGateway(t *testing.T, root string, servedBody []byte) (gatewayURL string, requests *atomic.Int32) {
 	t.Helper()
 
@@ -182,8 +183,21 @@ func ServeWholeFileGateway(t *testing.T, root string, servedBody []byte) (gatewa
 		}
 
 		requests.Add(1)
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Write(servedBody)
+		w.Header().Set("Content-Type", "application/x-tar")
+
+		archive := tar.NewWriter(w)
+		defer archive.Close()
+
+		header := &tar.Header{
+			Name:     root,
+			Mode:     0o644,
+			Size:     int64(len(servedBody)),
+			Typeflag: tar.TypeReg,
+		}
+		if err := archive.WriteHeader(header); err != nil {
+			return
+		}
+		archive.Write(servedBody)
 	})
 
 	server := httptest.NewServer(handler)

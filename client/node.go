@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,11 +42,12 @@ const (
 // node is a running libp2p host with a block exchange and a DHT, owned by
 // exactly one Client.
 type node struct {
-	cancel context.CancelFunc
-	host   host.Host
-	dht    *dht.IpfsDHT
-	http   network.BitSwapNetwork
-	bs     *bsclient.Client
+	cancel   context.CancelFunc
+	host     host.Host
+	dht      *dht.IpfsDHT
+	http     network.BitSwapNetwork
+	exchange network.BitSwapNetwork
+	bs       *bsclient.Client
 }
 
 // nodeConfig is everything a node needs to start.
@@ -91,27 +93,31 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	// One exchange over two transports, so a gateway and a libp2p peer are both
 	// just peers that might have the block.
 	node.http = httpnet.New(host, httpnet.WithUserAgent(userAgent))
-	exchange := network.New(host.Peerstore(), bsnet.NewFromIpfsHost(host), node.http)
+	node.exchange = network.New(host.Peerstore(), bsnet.NewFromIpfsHost(host), node.http)
 
 	node.bs = bsclient.New(
 		nodeCtx,
-		exchange,
+		node.exchange,
 		newProviderFinder(kadFinder, config.delegated),
 		blockstore.NewBlockstore(datastore.NewNullDatastore()),
 	)
-	exchange.Start(node.bs)
+	node.exchange.Start(node.bs)
 
-	// A reachable gateway alone is enough to retrieve content, so having one
-	// excuses failing to reach any libp2p peer.
-	gateways := connectToGateways(ctx, node.http, config.gateways)
+	// Dialled on the node's own context, not the caller's: these outlive the
+	// download that happened to start the node, and cancelling them with it would
+	// leave a reused node stuck on whichever peer answered first.
+	gateways := connectToGateways(ctx, nodeCtx, node.http, config.gateways)
 
-	if err := connectToPeers(ctx, host, config.peers); err != nil {
-		if gateways == 0 {
+	// Peers, gateways and an indexer are each enough on their own.
+	reachable := gateways > 0 || config.delegated != nil
+
+	if err := connectToPeers(ctx, nodeCtx, host, config.peers); err != nil {
+		if !reachable {
 			node.close()
 			return nil, err
 		}
 
-		fmt.Printf("continuing with %d gateway(s) despite: %s\n", gateways, err)
+		fmt.Printf("continuing without libp2p peers: %s\n", err)
 	}
 
 	if node.dht != nil {
@@ -180,7 +186,10 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 
 	// Staged and renamed, so a download abandoned at its deadline leaves no
 	// truncated file at output and does not race a retry writing the same path.
-	scratch, err := os.MkdirTemp(filepath.Dir(output), ".ipfs-download-")
+	// output is replaced if it already exists.
+	sweepScratch(filepath.Dir(output))
+
+	scratch, err := os.MkdirTemp(filepath.Dir(output), scratchPrefix)
 	if err != nil {
 		return err
 	}
@@ -198,6 +207,46 @@ func (node *node) download(ctx context.Context, cidStr string, output string, si
 	return os.Rename(staged, output)
 }
 
+const scratchPrefix = ".ipfs-download-"
+
+// How old a staging directory must be before it is treated as the remains of a
+// process that died rather than a download still running.
+const scratchStaleAfter = time.Hour
+
+// sweepScratch removes staging directories left behind by a previous run. The
+// deferred cleanup only covers a live process, and on mobile the app is killed
+// mid-download often enough that partial copies would otherwise accumulate in
+// the data directory without bound.
+func sweepScratch(dir string) {
+	sweepScratchPrefix(dir, scratchPrefix)
+}
+
+func sweepScratchPrefix(dir string, prefix string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		// Age matters: concurrent downloads stage alongside each other, so
+		// removing every match would delete a sibling's work in progress.
+		if time.Since(info.ModTime()) < scratchStaleAfter {
+			continue
+		}
+
+		os.RemoveAll(filepath.Join(dir, entry.Name()))
+	}
+}
+
 // close tolerates a partially built node, which is how startNode unwinds.
 func (node *node) close() {
 	node.cancel()
@@ -205,9 +254,14 @@ func (node *node) close() {
 	if node.bs != nil {
 		node.bs.Close()
 	}
-	if node.http != nil {
-		node.http.Stop()
+
+	// The whole exchange, not just the HTTP half: stopping only one leaves the
+	// other's connection event worker and host notifiee running for the life of
+	// the process.
+	if node.exchange != nil {
+		node.exchange.Stop()
 	}
+
 	if node.dht != nil {
 		node.dht.Close()
 	}
@@ -232,8 +286,8 @@ func makeHost(port int32) (host.Host, error) {
 }
 
 // parsePeers validates bootstrap addresses when the Client is built rather than
-// at the first download. Invalid entries are skipped; only an entirely unusable
-// list is an error.
+// at the first download. Invalid entries are skipped, and an empty result is not
+// an error: gateways or an indexer may be the only configured route.
 func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 	infos := make(map[peer.ID]*peer.AddrInfo, len(addrs))
 	order := make([]peer.ID, 0, len(addrs))
@@ -261,11 +315,7 @@ func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 		info.Addrs = append(info.Addrs, parsed.Addrs...)
 	}
 
-	if len(infos) == 0 {
-		if len(addrs) == 0 {
-			return nil, fmt.Errorf("no bootstrap peers configured, there is nobody to fetch blocks from")
-		}
-
+	if len(infos) == 0 && len(addrs) > 0 {
 		return nil, fmt.Errorf("none of the %d configured bootstrap peers is a valid address", len(addrs))
 	}
 
@@ -281,7 +331,7 @@ func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 // connectToGateways registers each gateway and reports how many answered.
 // Connecting means the endpoint responded to a probe, not that a libp2p
 // handshake completed. Unreachable gateways are logged, never fatal.
-func connectToGateways(ctx context.Context, exchange network.BitSwapNetwork, gateways []peer.AddrInfo) int {
+func connectToGateways(ctx context.Context, nodeCtx context.Context, exchange network.BitSwapNetwork, gateways []peer.AddrInfo) int {
 	if len(gateways) == 0 {
 		return 0
 	}
@@ -297,7 +347,7 @@ func connectToGateways(ctx context.Context, exchange network.BitSwapNetwork, gat
 		go func(gateway peer.AddrInfo) {
 			defer wait.Done()
 
-			if err := exchange.Connect(ctx, gateway); err != nil {
+			if err := exchange.Connect(nodeCtx, gateway); err != nil {
 				fmt.Printf("gateway %s unreachable: %s\n", gatewayName(gateway), err)
 				return
 			}
@@ -321,11 +371,12 @@ func gatewayName(gateway peer.AddrInfo) string {
 	return gateway.Addrs[0].String()
 }
 
-// connectToPeers dials every peer in parallel and returns once one answers. The
-// rest keep dialling in the background rather than holding up the caller.
-func connectToPeers(ctx context.Context, host host.Host, peers []peer.AddrInfo) error {
+// connectToPeers dials every peer in parallel and returns once one answers,
+// bounded by ctx. The rest keep dialling on nodeCtx rather than holding up the
+// caller, and so survive the download that started them.
+func connectToPeers(ctx context.Context, nodeCtx context.Context, host host.Host, peers []peer.AddrInfo) error {
 	if len(peers) == 0 {
-		return fmt.Errorf("no bootstrap peers configured, there is nobody to fetch blocks from")
+		return fmt.Errorf("no bootstrap peers configured")
 	}
 
 	var (
@@ -341,7 +392,7 @@ func connectToPeers(ctx context.Context, host host.Host, peers []peer.AddrInfo) 
 		go func(peerInfo peer.AddrInfo) {
 			defer wg.Done()
 
-			if err := host.Connect(ctx, peerInfo); err != nil {
+			if err := host.Connect(nodeCtx, peerInfo); err != nil {
 				fmt.Printf("failed to connect to %s: %s\n", peerInfo.ID, err)
 				return
 			}

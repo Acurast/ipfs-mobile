@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -471,7 +474,7 @@ func TestNewRejectsUnusableBootstrapLists(t *testing.T) {
 		peers []string
 		want  string
 	}{
-		{"empty", []string{}, "no bootstrap peers configured"},
+		{"empty", []string{}, "nowhere to fetch from"},
 		{"all invalid", []string{"", "not-a-multiaddr"}, "none of the 2 configured bootstrap peers"},
 		{"missing peer id", []string{"/ip4/127.0.0.1/tcp/4001"}, "none of the 1 configured bootstrap peers"},
 	}
@@ -505,71 +508,6 @@ func TestNewSkipsInvalidPeersButKeepsValidOnes(t *testing.T) {
 	}
 }
 
-func TestParsePeersMergesAddressesForOneID(t *testing.T) {
-	const id = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
-
-	peers, err := parsePeers([]string{
-		"/ip4/127.0.0.1/tcp/1/p2p/" + id,
-		"/ip4/127.0.0.2/tcp/2/p2p/" + id,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(peers) != 1 {
-		t.Fatalf("got %d peers, want 1", len(peers))
-	}
-	if len(peers[0].Addrs) != 2 {
-		t.Errorf("got %d addresses for the peer, want 2", len(peers[0].Addrs))
-	}
-}
-
-func TestConnectToPeersFailsWhenNoneAnswer(t *testing.T) {
-	peers, err := parsePeers([]string{deadPeer})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	host, err := makeHost(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer host.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	err = connectToPeers(ctx, host, peers)
-	if err == nil {
-		t.Fatal("expected an error when no peer answers, got nil")
-	}
-	if !strings.Contains(err.Error(), "failed to connect to any") {
-		t.Errorf("err = %v, want it to report that no peer answered", err)
-	}
-}
-
-func TestConnectToPeersReturnsOnFirstReachable(t *testing.T) {
-	addr, _ := testpeer.Serve(t, testpeer.Content(64))
-
-	peers, err := parsePeers([]string{deadPeer, addr})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	host, err := makeHost(0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer host.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := connectToPeers(ctx, host, peers); err != nil {
-		t.Errorf("a reachable peer was present but connect failed: %v", err)
-	}
-}
-
 func TestPackageGetFetchesAndCleansUp(t *testing.T) {
 	content := testpeer.Content(2048)
 	addr, root := testpeer.Serve(t, content)
@@ -592,25 +530,228 @@ func TestPackageGetFetchesAndCleansUp(t *testing.T) {
 	}
 }
 
-func TestDownloadLeavesNoScratchDirectories(t *testing.T) {
-	client, root, _ := servedClient(t, 2048)
+// With no caller deadline the verified phase has to be bounded anyway, or it runs
+// forever and the fallback below it is unreachable.
+func TestFallbackReachableWithoutCallerDeadline(t *testing.T) {
+	content := testpeer.Content(2048)
+	_, root, _ := testpeer.ServeTrustlessGateway(t, content)
+	gateway, requests := testpeer.ServeWholeFileGateway(t, root, content)
+
+	bootstrapAddr, _, _ := testpeer.ServeIsolated(t, testpeer.Content(64))
+
+	client := newClient(t, &Config{
+		BootstrapPeers:                 []string{bootstrapAddr},
+		DisableDHT:                     true,
+		Gateways:                       []string{gateway},
+		AllowUnverifiedGatewayFallback: true,
+		PrimaryTimeout:                 500 * time.Millisecond,
+	})
+
+	// Deliberately no deadline.
+	done := make(chan error, 1)
+	go func() {
+		done <- client.Get(context.Background(), root, filepath.Join(t.TempDir(), "out"), -1)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("fallback did not run: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Get never returned, so the verified phase was unbounded")
+	}
+
+	if requests.Load() == 0 {
+		t.Error("the gateway was never asked")
+	}
+}
+
+// A caller deadline may shorten the primary phase but never extend it, so some
+// of that deadline always survives for the fallback.
+func TestPrimaryTimeoutIsAnUpperBound(t *testing.T) {
+	addr, _ := testpeer.Serve(t, testpeer.Content(64))
+	gateway, _, _ := testpeer.ServeTrustlessGateway(t, testpeer.Content(64))
+
+	client := newClient(t, &Config{
+		BootstrapPeers:                 []string{addr},
+		Gateways:                       []string{gateway},
+		AllowUnverifiedGatewayFallback: true,
+		PrimaryTimeout:                 2 * time.Second,
+	})
+
+	tests := []struct {
+		name          string
+		callerTimeout time.Duration
+		want          time.Duration
+	}{
+		// The share of a generous deadline exceeds the configured bound, so the
+		// bound wins and the rest is left for the fallback.
+		{"generous deadline", time.Minute, 2 * time.Second},
+
+		// A tight deadline's share is smaller, so it wins instead.
+		{"tight deadline", time.Second, 750 * time.Millisecond},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), test.callerTimeout)
+			defer cancel()
+
+			primary, release := client.primaryDeadline(ctx)
+			defer release()
+
+			deadline, ok := primary.Deadline()
+			if !ok {
+				t.Fatal("the primary phase was left unbounded")
+			}
+
+			budget := time.Until(deadline)
+			if budget > test.want+250*time.Millisecond {
+				t.Errorf("primary budget = %v, want about %v", budget, test.want)
+			}
+		})
+	}
+}
+
+// With no caller deadline the configured bound is what applies.
+func TestPrimaryTimeoutAppliesWithoutCallerDeadline(t *testing.T) {
+	addr, _ := testpeer.Serve(t, testpeer.Content(64))
+	gateway, _, _ := testpeer.ServeTrustlessGateway(t, testpeer.Content(64))
+
+	client := newClient(t, &Config{
+		BootstrapPeers:                 []string{addr},
+		Gateways:                       []string{gateway},
+		AllowUnverifiedGatewayFallback: true,
+		PrimaryTimeout:                 3 * time.Second,
+	})
+
+	primary, release := client.primaryDeadline(context.Background())
+	defer release()
+
+	deadline, ok := primary.Deadline()
+	if !ok {
+		t.Fatal("the primary phase was left unbounded")
+	}
+
+	if budget := time.Until(deadline); budget > 3*time.Second+250*time.Millisecond {
+		t.Errorf("primary budget = %v, want about 3s", budget)
+	}
+}
+
+func TestTimeoutsDefaultWhenUnset(t *testing.T) {
+	addr, _ := testpeer.Serve(t, testpeer.Content(64))
+
+	client := newClient(t, &Config{BootstrapPeers: []string{addr}})
+
+	if client.primaryTimeout != defaultPrimaryTimeout {
+		t.Errorf("primaryTimeout = %v, want %v", client.primaryTimeout, defaultPrimaryTimeout)
+	}
+	if client.fallbackStepTimeout != defaultFallbackStepTimeout {
+		t.Errorf("fallbackStepTimeout = %v, want %v", client.fallbackStepTimeout, defaultFallbackStepTimeout)
+	}
+}
+
+// A closed Client must not reach the network, and must not report success.
+func TestGetAfterCloseDoesNotFallBack(t *testing.T) {
+	content := testpeer.Content(1024)
+	_, root, _ := testpeer.ServeTrustlessGateway(t, content)
+
+	var asked atomic.Int32
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked.Add(1)
+		http.Error(w, "should not be called", http.StatusTeapot)
+	}))
+	t.Cleanup(gateway.Close)
+
+	bootstrapAddr, _, _ := testpeer.ServeIsolated(t, testpeer.Content(64))
+
+	client := newClient(t, &Config{
+		BootstrapPeers:                 []string{bootstrapAddr},
+		DisableDHT:                     true,
+		Gateways:                       []string{gateway.URL},
+		AllowUnverifiedGatewayFallback: true,
+	})
+
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	err := client.Get(ctx, root, filepath.Join(t.TempDir(), "out"), -1)
+	if !errors.Is(err, ErrClosed) {
+		t.Errorf("err = %v, want ErrClosed", err)
+	}
+	if asked.Load() != 0 {
+		t.Errorf("a closed client made %d gateway requests", asked.Load())
+	}
+}
+
+// A gateway-only Client is a valid configuration, and so is an indexer-only one.
+func TestNewAcceptsGatewayOnlyAndIndexerOnly(t *testing.T) {
+	content := testpeer.Content(1024)
+	gateway, root, blockRequests := testpeer.ServeTrustlessGateway(t, content)
+
+	t.Run("gateway only", func(t *testing.T) {
+		client := newClient(t, &Config{Gateways: []string{gateway}, DisableDHT: true})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := client.Get(ctx, root, filepath.Join(t.TempDir(), "out"), -1); err != nil {
+			t.Fatalf("gateway-only client could not fetch: %v", err)
+		}
+		if blockRequests.Load() == 0 {
+			t.Error("the gateway was never used")
+		}
+	})
+
+	t.Run("indexer only", func(t *testing.T) {
+		indexer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"Providers":[]}`))
+		}))
+		t.Cleanup(indexer.Close)
+
+		if _, err := New(&Config{DelegatedRoutingEndpoint: indexer.URL}); err != nil {
+			t.Errorf("indexer-only client rejected: %v", err)
+		}
+	})
+}
+
+func TestNewRejectsConfigWithNowhereToFetchFrom(t *testing.T) {
+	_, err := New(&Config{})
+	if err == nil {
+		t.Fatal("expected an error when nothing at all is configured")
+	}
+	if !strings.Contains(err.Error(), "nowhere to fetch from") {
+		t.Errorf("err = %v, want it to say there is nowhere to fetch from", err)
+	}
+}
+
+// Documented behaviour: a successful download replaces whatever was at output.
+func TestGetReplacesExistingOutput(t *testing.T) {
+	client, root, content := servedClient(t, 1024)
+
+	output := filepath.Join(t.TempDir(), "out")
+	if err := os.WriteFile(output, []byte("stale content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	dir := t.TempDir()
-	if err := client.Get(ctx, root, filepath.Join(dir, "out"), -1); err != nil {
-		t.Fatal(err)
+	if err := client.Get(ctx, root, output, -1); err != nil {
+		t.Fatalf("Get over an existing file failed: %v", err)
 	}
 
-	entries, err := os.ReadDir(dir)
+	got, err := os.ReadFile(output)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".ipfs-download-") {
-			t.Errorf("scratch directory %q was left behind", entry.Name())
-		}
+	if !bytes.Equal(got, content) {
+		t.Error("output was not replaced with the downloaded content")
 	}
 }

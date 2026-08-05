@@ -13,6 +13,11 @@ import (
 // ErrClosed is returned by Get once the Client has been closed.
 var ErrClosed = errors.New("client is closed")
 
+const (
+	defaultPrimaryTimeout      = 15 * time.Second
+	defaultFallbackStepTimeout = 15 * time.Second
+)
+
 type Config struct {
 	BootstrapPeers []string
 	Port           int32
@@ -37,6 +42,22 @@ type Config struct {
 	// alongside libp2p peers. What they return is verified like any other block.
 	Gateways []string
 
+	// PrimaryTimeout is the most the primary phase - peers and gateways, every
+	// block verified - may take before the fallback is allowed to start. Zero or
+	// negative uses 15s.
+	//
+	// A caller deadline shortens it but cannot extend it, so some of that deadline
+	// always survives for the fallback to use.
+	PrimaryTimeout time.Duration
+
+	// FallbackStepTimeout is the most any single gateway attempt in the fallback
+	// may take. Zero or negative uses 15s.
+	//
+	// Per attempt rather than per phase, so a run of dead gateways cannot starve
+	// the one that would have answered. With no caller deadline the fallback can
+	// therefore run for this long once per configured gateway.
+	FallbackStepTimeout time.Duration
+
 	// AllowUnverifiedGatewayFallback permits a whole-file fetch from Gateways once
 	// every verified route has failed.
 	//
@@ -52,8 +73,10 @@ type Client struct {
 	config nodeConfig
 	idle   time.Duration
 
-	gateways        []string
-	allowUnverified bool
+	gateways            []string
+	allowUnverified     bool
+	primaryTimeout      time.Duration
+	fallbackStepTimeout time.Duration
 
 	mutex    sync.Mutex
 	node     *node
@@ -91,27 +114,50 @@ func New(config *Config) (*Client, error) {
 		node.delegated = delegated
 	}
 
+	// Peers, gateways and an indexer are each enough on their own, so the
+	// requirement is only that at least one of them is configured.
+	if len(peers) == 0 && len(gateways) == 0 && node.delegated == nil {
+		return nil, errors.New("no bootstrap peers, gateways or delegated routing endpoint configured, there is nowhere to fetch from")
+	}
+
 	return &Client{
-		config:          node,
-		idle:            config.IdleTimeout,
-		gateways:        config.Gateways,
-		allowUnverified: config.AllowUnverifiedGatewayFallback,
+		config:              node,
+		idle:                config.IdleTimeout,
+		gateways:            config.Gateways,
+		allowUnverified:     config.AllowUnverifiedGatewayFallback,
+		primaryTimeout:      orDefault(config.PrimaryTimeout, defaultPrimaryTimeout),
+		fallbackStepTimeout: orDefault(config.FallbackStepTimeout, defaultFallbackStepTimeout),
 	}, nil
+}
+
+func orDefault(configured time.Duration, fallback time.Duration) time.Duration {
+	if configured <= 0 {
+		return fallback
+	}
+
+	return configured
 }
 
 // Get downloads cid to output, giving up when ctx is done. A sizeLimit above
 // zero rejects larger content before it is written.
 //
-// Peers and gateways are fetched from together and verified block by block. Only
-// once that fails, and Config.AllowUnverifiedGatewayFallback is set, does it fall
-// back to an unverified whole-file gateway fetch.
+// The primary phase fetches from peers and gateways together, verifying every
+// block. Only once that fails, and Config.AllowUnverifiedGatewayFallback is set,
+// does it fall back to an unverified gateway fetch.
+//
+// On success output is replaced, whether or not something was already there.
 func (client *Client) Get(ctx context.Context, cid string, output string, sizeLimit int64) error {
-	verified, cancel := client.verifiedDeadline(ctx)
+	primary, cancel := client.primaryDeadline(ctx)
 	defer cancel()
 
-	err := client.getVerified(verified, cid, output, sizeLimit)
+	err := client.getPrimary(primary, cid, output, sizeLimit)
 	if err == nil {
 		return nil
+	}
+
+	// Closed means closed: no fallback, no network.
+	if errors.Is(err, ErrClosed) {
+		return err
 	}
 
 	// No other source returns smaller content.
@@ -120,17 +166,17 @@ func (client *Client) Get(ctx context.Context, cid string, output string, sizeLi
 		return err
 	}
 
-	// Only the internal deadline above leaves budget for anything else; the
-	// caller's own deadline or cancellation ends it here.
+	// Only the primary phase's own deadline leaves budget for anything else; the
+	// caller's deadline or cancellation ends it here.
 	if ctx.Err() != nil {
 		return contextError(ctx)
 	}
 
-	if !client.allowUnverified || len(client.gateways) == 0 {
+	if !client.fallbackAvailable() {
 		return err
 	}
 
-	fmt.Printf("verified retrieval of %s failed (%s), trying gateways unverified\n", cid, err)
+	fmt.Printf("primary retrieval of %s failed (%s), trying gateways unverified\n", cid, err)
 
 	fallbackErr := client.fetchFromGateways(ctx, cid, output, sizeLimit)
 	if fallbackErr == nil {
@@ -138,7 +184,7 @@ func (client *Client) Get(ctx context.Context, cid string, output string, sizeLi
 	}
 
 	// The Kotlin wrapper selects SizeLimitExceededException on the message prefix,
-	// so this must not be buried behind the verified failure by errors.Join.
+	// so this must not be buried behind the primary failure by errors.Join.
 	if errors.As(fallbackErr, &tooBig) {
 		return fallbackErr
 	}
@@ -146,31 +192,35 @@ func (client *Client) Get(ctx context.Context, cid string, output string, sizeLi
 	return errors.Join(err, fallbackErr)
 }
 
-// verifiedShare is how much of the caller's remaining time the verified routes
+// primaryShare caps how much of the caller's remaining time the primary phase
 // may spend, so a hanging route still leaves budget to fall back with.
-const verifiedShare = 0.75
+const primaryShare = 0.75
 
-func (client *Client) verifiedDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
-	if !client.allowUnverified || len(client.gateways) == 0 {
-		return context.WithCancel(ctx)
-	}
-
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return context.WithCancel(ctx)
-	}
-
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return context.WithCancel(ctx)
-	}
-
-	return context.WithTimeout(ctx, time.Duration(float64(remaining)*verifiedShare))
+func (client *Client) fallbackAvailable() bool {
+	return client.allowUnverified && len(client.gateways) > 0
 }
 
-// getVerified fetches over the block exchange, where every block is checked
+func (client *Client) primaryDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if !client.fallbackAvailable() {
+		return context.WithCancel(ctx)
+	}
+
+	// Always bounded: without this the primary phase runs until the caller's
+	// deadline, or forever when there is none, and the fallback never starts.
+	budget := client.primaryTimeout
+
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining > 0 {
+			budget = min(budget, time.Duration(float64(remaining)*primaryShare))
+		}
+	}
+
+	return context.WithTimeout(ctx, budget)
+}
+
+// getPrimary fetches over the block exchange, where every block is checked
 // against the CID that asked for it.
-func (client *Client) getVerified(ctx context.Context, cid string, output string, sizeLimit int64) error {
+func (client *Client) getPrimary(ctx context.Context, cid string, output string, sizeLimit int64) error {
 	result := make(chan error, 1)
 
 	// Started on its own goroutine so the select below returns at the deadline

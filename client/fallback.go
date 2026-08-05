@@ -1,6 +1,7 @@
 package client
 
 import (
+	"archive/tar"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"time"
 )
+
+const gatewayScratchPrefix = ".ipfs-gateway-"
 
 // SizeLimitError reports content larger than the caller allowed. A distinct
 // type because no other source will return smaller content, so it ends the
@@ -27,7 +30,7 @@ func (err *SizeLimitError) Error() string {
 // fetchFromGateways downloads cid over plain HTTP, keeping the first gateway
 // that answers.
 //
-// NOT verified, unlike every other path here. A whole-file response cannot be
+// NOT verified, unlike every other path here. A gateway response cannot be
 // checked against its CID, which commits to a DAG rather than to bytes, so this
 // content is trusted because the gateway served it.
 func (client *Client) fetchFromGateways(ctx context.Context, cid string, output string, sizeLimit int64) error {
@@ -38,7 +41,10 @@ func (client *Client) fetchFromGateways(ctx context.Context, cid string, output 
 	failures := make([]string, 0, len(client.gateways))
 
 	for _, gateway := range client.gateways {
-		err := fetchFromGateway(ctx, gateway, cid, output, sizeLimit)
+		attempt, cancel := context.WithTimeout(ctx, client.fallbackStepTimeout)
+		err := fetchFromGateway(attempt, gateway, cid, output, sizeLimit)
+		cancel()
+
 		if err == nil {
 			return nil
 		}
@@ -58,16 +64,23 @@ func (client *Client) fetchFromGateways(ctx context.Context, cid string, output 
 	return fmt.Errorf("no gateway served the content (%s)", strings.Join(failures, "; "))
 }
 
+// fetchFromGateway asks for the content as a tar archive rather than as a plain
+// body.
+//
+// A plain GET of a directory CID returns the gateway's HTML index page, which
+// would be written out as though it were the content. Tar carries the file or
+// directory tree itself, so what lands at output has the right shape.
 func fetchFromGateway(ctx context.Context, gateway string, cid string, output string, sizeLimit int64) error {
 	target, err := url.JoinPath(gateway, "ipfs", cid)
 	if err != nil {
 		return err
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target+"?format=tar", nil)
 	if err != nil {
 		return err
 	}
+	request.Header.Set("Accept", "application/x-tar")
 	request.Header.Set("User-Agent", userAgent)
 
 	response, err := gatewayHTTPClient.Do(request)
@@ -80,21 +93,21 @@ func fetchFromGateway(ctx context.Context, gateway string, cid string, output st
 		return fmt.Errorf("http %d", response.StatusCode)
 	}
 
-	// Reject on the advertised length before transferring anything.
-	if sizeLimit > 0 && response.ContentLength > sizeLimit {
-		return &SizeLimitError{Size: response.ContentLength, Limit: sizeLimit}
+	// Refuse anything that is not the archive that was asked for, so an HTML error
+	// page or index cannot be mistaken for content.
+	if mediaType := response.Header.Get("Content-Type"); mediaType != "" && !strings.HasPrefix(mediaType, "application/x-tar") {
+		return fmt.Errorf("gateway served %q, want application/x-tar", mediaType)
 	}
 
-	// Staged and renamed, so a failed transfer leaves no partial file at output.
-	scratch, err := os.MkdirTemp(filepath.Dir(output), ".ipfs-gateway-")
+	sweepScratchPrefix(filepath.Dir(output), gatewayScratchPrefix)
+
+	scratch, err := os.MkdirTemp(filepath.Dir(output), gatewayScratchPrefix)
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(scratch)
 
-	staged := filepath.Join(scratch, "data")
-
-	written, err := writeLimited(staged, response.Body, sizeLimit)
+	staged, written, err := extractTar(scratch, response.Body, sizeLimit)
 	if err != nil {
 		return err
 	}
@@ -108,8 +121,94 @@ func fetchFromGateway(ctx context.Context, gateway string, cid string, output st
 	return os.Rename(staged, output)
 }
 
+// extractTar unpacks the archive into dir and returns the path of its single
+// root entry, which is what gets moved into place.
+//
+// The archive comes from a source this path does not trust, so entries that
+// escape dir, and anything that is not a plain file or directory, are refused
+// rather than skipped: a gateway with no reason to send them is misbehaving.
+func extractTar(dir string, body io.Reader, sizeLimit int64) (root string, written int64, err error) {
+	archive := tar.NewReader(body)
+
+	for {
+		header, err := archive.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", written, err
+		}
+
+		path, top, err := resolveTarPath(dir, header.Name)
+		if err != nil {
+			return "", written, err
+		}
+
+		// The top level component, not the first entry: entries arrive in whatever
+		// order the archive lists them, so the first one may be a nested file.
+		if root == "" {
+			root = top
+		}
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				return "", written, err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return "", written, err
+			}
+
+			remaining := int64(-1)
+			if sizeLimit > 0 {
+				remaining = sizeLimit - written
+			}
+
+			count, err := writeLimited(path, archive, remaining)
+			written += count
+			if err != nil {
+				return "", written, err
+			}
+		default:
+			return "", written, fmt.Errorf("unsupported tar entry %q of type %d", header.Name, header.Typeflag)
+		}
+	}
+
+	if root == "" {
+		return "", written, fmt.Errorf("gateway served an empty archive")
+	}
+
+	return root, written, nil
+}
+
+// resolveTarPath places a tar entry under dir, refusing any name that would
+// escape it, and reports the top level path the entry sits beneath.
+func resolveTarPath(dir string, name string) (path string, top string, err error) {
+	if name == "" {
+		return "", "", fmt.Errorf("tar entry has no name")
+	}
+
+	// Rooting the name before cleaning collapses any ".." it contains, so the
+	// result cannot climb above dir.
+	cleaned := filepath.Clean("/" + filepath.FromSlash(name))
+	path = filepath.Join(dir, cleaned)
+
+	if path != dir && !strings.HasPrefix(path, dir+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("tar entry %q escapes the staging directory", name)
+	}
+
+	elements := strings.Split(strings.TrimPrefix(filepath.ToSlash(cleaned), "/"), "/")
+	if len(elements) == 0 || elements[0] == "" {
+		return "", "", fmt.Errorf("tar entry %q has no top level name", name)
+	}
+
+	return path, filepath.Join(dir, elements[0]), nil
+}
+
 // writeLimited streams body to path, stopping if it exceeds sizeLimit. Enforced
-// on the bytes that arrive, since Content-Length may be absent or wrong.
+// on the bytes that arrive, since Content-Length may be absent or wrong. A
+// negative limit means unlimited.
 func writeLimited(path string, body io.Reader, sizeLimit int64) (int64, error) {
 	file, err := os.Create(path)
 	if err != nil {
@@ -117,7 +216,7 @@ func writeLimited(path string, body io.Reader, sizeLimit int64) (int64, error) {
 	}
 	defer file.Close()
 
-	if sizeLimit <= 0 {
+	if sizeLimit < 0 {
 		return io.Copy(file, body)
 	}
 
@@ -134,8 +233,8 @@ func writeLimited(path string, body io.Reader, sizeLimit int64) (int64, error) {
 	return written, nil
 }
 
-// No overall timeout: the caller's context bounds the request, and a fixed one
-// would cut off a large but healthy download.
+// No overall timeout: Config.FallbackStepTimeout bounds each attempt, and a fixed
+// one here would cut off a large but healthy download.
 var gatewayHTTPClient = &http.Client{
 	Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,

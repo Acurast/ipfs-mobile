@@ -14,7 +14,10 @@ import (
 func newTestClient(t *testing.T, bootstrapPeers string, idleTimeout int64) *Client {
 	t.Helper()
 
-	client, err := NewClient(bootstrapPeers, 0, idleTimeout, "", "", false)
+	client, err := NewClient(&ClientConfig{
+		BootstrapPeers: bootstrapPeers,
+		IdleTimeout:    idleTimeout,
+	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -76,7 +79,7 @@ func TestNewClientRejectsUnusablePeerLists(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			client, err := NewClient(test.peers, 0, 0, "", "", false)
+			client, err := NewClient(&ClientConfig{BootstrapPeers: test.peers})
 			if err == nil {
 				client.Close()
 				t.Fatal("expected an error, got nil")
@@ -164,7 +167,7 @@ func TestClientGetEnforcesSizeLimit(t *testing.T) {
 func TestClientCloseIsIdempotent(t *testing.T) {
 	addr, _ := testpeer.Serve(t, testpeer.Content(64))
 
-	client, err := NewClient(addr, 0, 0, "", "", false)
+	client, err := NewClient(&ClientConfig{BootstrapPeers: addr})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,5 +265,61 @@ func TestGetOneShotReportsBadConfig(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected an error for an empty peer list, got nil")
+	}
+}
+
+// The struct carries the options the positional form could not extend, so the
+// gateway fields have to reach the client. Timeout plumbing is covered by
+// TestMilliseconds and by the client's own tests.
+func TestNewClientCarriesGatewayOptions(t *testing.T) {
+	content := testpeer.Content(2048)
+	gateway, root, blockRequests := testpeer.ServeTrustlessGateway(t, content)
+
+	client, err := NewClient(&ClientConfig{
+		Gateways:                       gateway,
+		AllowUnverifiedGatewayFallback: true,
+		PrimaryTimeout:                 20000,
+		FallbackStepTimeout:            5000,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	output := filepath.Join(t.TempDir(), "out")
+	if err := client.Get(root, output, -1, 30000); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if blockRequests.Load() == 0 {
+		t.Error("the configured gateway was never used")
+	}
+}
+
+// A gateway-only client needs no bootstrap peers at all.
+func TestNewClientAcceptsGatewaysWithoutPeers(t *testing.T) {
+	gateway, _, _ := testpeer.ServeTrustlessGateway(t, testpeer.Content(64))
+
+	client, err := NewClient(&ClientConfig{Gateways: gateway})
+	if err != nil {
+		t.Fatalf("gateway-only config rejected: %v", err)
+	}
+	client.Close()
+}
+
+func TestMilliseconds(t *testing.T) {
+	tests := []struct {
+		value int64
+		want  time.Duration
+	}{
+		{-1, 0},
+		{0, 0},
+		{1500, 1500 * time.Millisecond},
+	}
+
+	for _, test := range tests {
+		if got := milliseconds(test.value); got != test.want {
+			t.Errorf("milliseconds(%d) = %v, want %v", test.value, got, test.want)
+		}
 	}
 }
