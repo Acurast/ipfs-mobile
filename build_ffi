@@ -3,6 +3,14 @@
 CURR_DIR=$(dirname "${BASH_SOURCE[0]}")
 PLATFORM=$1
 
+# -buildid= keeps the output reproducible.
+#
+# -checklinkname=0 restores the pre Go 1.23 //go:linkname rules. go-libp2p pulls
+# in github.com/wlynxg/anet, which reaches into net.zoneCache by linkname and so
+# is rejected by the current linker. Without this the mobile build cannot link at
+# all; drop it once anet is fixed upstream.
+LDFLAGS="-buildid= -checklinkname=0"
+
 function usage () {
     echo "Usage: $0 <android|ios>"
     echo ""
@@ -70,13 +78,21 @@ function bind_android () {
     ANDROID_API=$(grep "minSdk" $CURR_DIR/android/app/build.gradle.kts | awk '{print $3}' | tr -d "'\"" )
     echo "  [android]"
     echo -en "    / API $ANDROID_API"
-    if gomobile bind -o $CURR_DIR/android/ffi/ipfs.aar -target=android/arm,android/arm64 -androidapi $ANDROID_API -trimpath -ldflags=-buildid= $CURR_DIR/ffi; then
+    if gomobile bind -o $CURR_DIR/android/ffi/ipfs.aar -target=android/arm,android/arm64 -androidapi $ANDROID_API -trimpath -ldflags="$LDFLAGS" $CURR_DIR/ffi; then
         echo -e "\r    \xE2\x9C\x94 API $ANDROID_API"
     else
         echo -e "\r    \xE2\x9C\x97 API $ANDROID_API"
+        ERROR="gomobile bind failed for android/arm,android/arm64"
     fi
 
     go mod tidy
+
+    # Without this a failed bind still exits 0, so CI publishes whatever aar
+    # happened to be lying around from a previous build.
+    if [[ -n "${ERROR}" ]]; then
+        echo "Error: $ERROR."
+        exit 1
+    fi
 }
 
 function bind_ios () {
@@ -84,9 +100,20 @@ function bind_ios () {
 
     go get golang.org/x/mobile
 
-    gomobile bind -o $CURR_DIR/IPFS.xcframework -target=ios $CURR_DIR/ffi
+    echo "  [ios]"
+    if gomobile bind -o $CURR_DIR/IPFS.xcframework -target=ios -trimpath -ldflags="$LDFLAGS" $CURR_DIR/ffi; then
+        echo -e "    \xE2\x9C\x94 ios"
+    else
+        echo -e "    \xE2\x9C\x97 ios"
+        ERROR="gomobile bind failed for ios"
+    fi
 
     go mod tidy
+
+    if [[ -n "${ERROR}" ]]; then
+        echo "Error: $ERROR."
+        exit 1
+    fi
 }
 
 # Validate platform argument
