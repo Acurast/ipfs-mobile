@@ -38,40 +38,25 @@ import (
 )
 
 const (
-	// Upper bound on waiting for a usable DHT routing table.
-	dhtReadyTimeout = 5 * time.Second
-	dhtReadyPoll    = 50 * time.Millisecond
-
 	// How long startup waits for the first peer or gateway to answer. Dialling
 	// carries on past it; only the waiting stops.
 	startupTimeout = 2 * time.Second
 
-	// Connection watermarks: above the high one, connections are trimmed back to
-	// the low one. go-libp2p defaults to 160/192, which suits a server. A DHT
-	// lookup opens as many connections as it is allowed to, and on a phone each
-	// one costs battery and a slot in the carrier's NAT table.
-	lowWaterConnections  = 16
-	highWaterConnections = 32
-
-	// New connections are exempt from trimming for this long. The default minute
-	// leaves a lookup's connections all held through the burst that opened them.
+	// Above the high water mark connections are trimmed back to the low one, and
+	// new ones are exempt for the grace period. Well under go-libp2p's own, which
+	// are a server's: a routing lookup fills whatever it is given, and on a phone
+	// every connection costs battery and a slot in the carrier's NAT table.
+	lowWaterConnections   = 16
+	highWaterConnections  = 32
 	connectionGracePeriod = 20 * time.Second
 
-	// Marks the peers named in the configuration, which are the ones that hold the
-	// content, so a lookup filling the connection table cannot displace them.
+	// Peers named in the configuration are the ones holding the content, so a
+	// lookup filling the connection table must not displace them.
 	configuredPeerTag = "configured"
 
-	// How many peers a lookup queries at once, and how many it checks for
-	// admission to the routing table at once. The defaults, 10 and 256, suit a
-	// machine that can afford the connections: bootstrapping under them peaks
-	// around 76 and spikes past 100, against 40 and a ceiling of 47 here.
-	//
-	// Measured, not guessed - the two are not interchangeable. Lowering the
-	// admission check alone left the median where it was; the query width is what
-	// the burst follows. Narrower means a lookup walks the network in more rounds,
-	// which is the trade: slightly slower lookups for a burst a phone survives.
+	// How many peers a lookup queries at once. Narrower than the default, which
+	// trades a few more rounds per lookup for a burst a phone survives.
 	dhtQueryConcurrency = 3
-	dhtAdmissionChecks  = 16
 )
 
 // node is a running libp2p host with a block exchange and a DHT, owned by
@@ -105,8 +90,7 @@ type nodeConfig struct {
 }
 
 // startNode brings up a host and gives its dials a short head start, bounded by
-// ctx. It fails only when there is provably nowhere to fetch from, which beats
-// letting the download wait out the deadline to learn the same thing.
+// ctx. It fails only when there is provably nowhere to fetch from.
 func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	host, err := makeHost(config.port, config.resolver)
 	if err != nil {
@@ -128,7 +112,6 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 			dht.Mode(dht.ModeClient),
 			dht.BootstrapPeers(config.peers...),
 			dht.Concurrency(dhtQueryConcurrency),
-			dht.LookupCheckConcurrency(dhtAdmissionChecks),
 		)
 		if err != nil {
 			node.close()
@@ -141,15 +124,11 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 
 	// One exchange over two transports, so a gateway and a libp2p peer are both
 	// just peers that might have the block.
-	// Only the configured gateways may be reached over HTTP. Content routing hands
-	// back addresses chosen by whoever answered the lookup, and an HTTP address
-	// becomes a GET - so without this a hostile provider record turns the device
-	// into a probe against its own network. Blocks are hashed either way, so the
-	// exposure is egress rather than content, but the library already knows which
-	// HTTP hosts are legitimate and there is no reason to talk to others.
 	//
-	// With no gateways configured there is nothing to allow, so the HTTP half is
-	// left out entirely and the router runs bitswap alone.
+	// Held to the configured gateways: content routing hands back addresses chosen
+	// by whoever answered the lookup, and an HTTP address becomes a GET, so a
+	// hostile provider record would otherwise aim the device at its own network.
+	// Blocks are hashed either way, so the exposure is egress rather than content.
 	if len(config.gatewayHosts) > 0 {
 		node.http = httpnet.New(
 			host,
@@ -168,10 +147,9 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	)
 	node.exchange.Start(node.bs)
 
-	// A DHT lookup meets far more peers than the configuration names, and without
-	// this the connection manager would treat them all alike - trimming the peer
-	// holding the content in favour of one that happened to answer a lookup. Where
-	// gateways are blocked, that peer is the only way to the content at all.
+	// A lookup meets far more peers than the configuration names. The DHT protects
+	// the ones it puts in its routing table; a peer that only serves content never
+	// gets there, so it is protected here instead.
 	for _, peerInfo := range config.peers {
 		host.ConnManager().Protect(peerInfo.ID, configuredPeerTag)
 	}
@@ -186,9 +164,7 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	peers := dialAll(nodeCtx, config.peers, host.Connect, peerName)
 
 	// Bitswap asks whoever is connected and asks again as others arrive, so
-	// startup only needs somewhere to send the first request. Waiting for the
-	// remaining dials would spend the download's time on connections it can pick
-	// up while it runs.
+	// startup only needs somewhere to send the first request.
 	awaitConnection(ctx, gateways, peers)
 
 	// Peers, gateways and an indexer are each enough on their own.
@@ -242,28 +218,11 @@ func awaitConnection(ctx context.Context, gateways, peers *dialGroup) {
 	}
 }
 
-// bootstrapDHT fills the routing table, which a lookup needs to find anything.
-// Never fatal: connected peers may hold the content anyway, and the table keeps
-// filling during the download.
+// bootstrapDHT starts the routing table filling. Never fatal: connected peers
+// may hold the content anyway, and the table keeps filling during the download.
 func (node *node) bootstrapDHT(ctx context.Context) {
 	if err := node.dht.Bootstrap(ctx); err != nil {
 		fmt.Printf("failed to bootstrap the dht: %s\n", err)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, dhtReadyTimeout)
-	defer cancel()
-
-	ticker := time.NewTicker(dhtReadyPoll)
-	defer ticker.Stop()
-
-	for node.dht.RoutingTable().Size() == 0 {
-		select {
-		case <-ticker.C:
-		case <-ctx.Done():
-			fmt.Printf("dht routing table still empty after %s, continuing anyway\n", dhtReadyTimeout)
-			return
-		}
 	}
 }
 
@@ -324,13 +283,12 @@ const scratchPrefix = ".ipfs-download-"
 // process that died rather than a download still running.
 const scratchStaleAfter = time.Hour
 
-// Staging directories this process is currently writing into. A download's own
-// directory is never a candidate for sweeping, however long it takes: age alone
-// cannot tell a slow download from an abandoned one, since writing a file does
-// not advance the modified time of the directory holding it.
+// Staging directories this process is writing into, which the sweep leaves alone
+// however old they look: writing a file does not advance the modified time of the
+// directory holding it, so age cannot tell a slow download from an abandoned one.
 var staging sync.Map
 
-// claimScratch creates a staging directory under dir and returns it with the
+// claimScratch creates a staging directory under dir, returning it with the
 // function that releases and removes it.
 func claimScratch(dir string, prefix string) (string, func(), error) {
 	scratch, err := os.MkdirTemp(dir, prefix)
@@ -488,12 +446,10 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 		libp2p.Identity(priv),
 		libp2p.ConnectionManager(connections),
 
-		// Noise before TLS, reversing go-libp2p's own order. Every libp2p
-		// implementation has to support Noise, fewer support TLS, and a proposal
-		// the peer rejects costs a round trip before the handshake even starts.
-		//
-		// That round trip is the difference between reaching a peer with a tight
-		// handshake deadline and not.
+		// Noise before TLS, reversing go-libp2p's order. Every implementation has
+		// to support Noise and fewer support TLS, so offering it first usually
+		// avoids a rejected proposal - a round trip a peer with a tight handshake
+		// deadline may not have to spare.
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
 	}

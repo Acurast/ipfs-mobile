@@ -15,15 +15,13 @@ import (
 
 const dnsPort = "53"
 
-// newResolver builds a resolver that queries the given servers directly, for
-// libp2p to resolve addresses with.
+// newResolver builds the resolver libp2p resolves addresses with, querying the
+// given servers directly. None returns none, leaving libp2p its own.
 //
-// A /dnsaddr/ address is a TXT record, and Android publishes no resolver
-// configuration for TXT lookups to be built from, so they fail there while plain
-// host lookups go through the platform and succeed. Naming the servers is what
-// makes /dnsaddr/ resolvable, bootstrap peers included.
-//
-// No servers returns no resolver, leaving libp2p its own.
+// A /dnsaddr/ address needs a TXT lookup, and Android publishes no resolver
+// configuration to build one from - plain host lookups go through the platform
+// and survive, TXT ones do not. Naming the servers is what makes such an address
+// resolvable at all.
 func newResolver(servers []string) (network.MultiaddrDNSResolver, error) {
 	if len(servers) == 0 {
 		return nil, nil

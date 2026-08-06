@@ -247,11 +247,6 @@ func TestFallbackFailureReportsBothCauses(t *testing.T) {
 	}
 }
 
-// An entirely invalid gateway list is a configuration mistake, but on its own it
-// is not fatal: see TestMalformedGatewayListDoesNotSinkAWorkingClient, which
-// covers the case where peers still provide a route. It only fails the build
-// when nothing else does, which TestNewRejectsUnusableBootstrapLists covers.
-
 func TestNewSkipsInvalidGatewaysButKeepsValidOnes(t *testing.T) {
 	content := testpeer.Content(1024)
 	gateway, root, blockRequests := testpeer.ServeTrustlessGateway(t, content)

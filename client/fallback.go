@@ -26,10 +26,8 @@ type SizeLimitError struct {
 	Limit int64
 }
 
-// sizeLimitWithTotals restates a size limit error in the caller's terms.
-// writeLimited is handed whatever is left of the budget, so on its own it
-// reports the residual as the limit and one entry's bytes as the size - neither
-// of which is what the caller asked for.
+// sizeLimitWithTotals restates a size limit error in the caller's terms, since
+// writeLimited only ever sees its own share of the budget.
 func sizeLimitWithTotals(err error, written int64, sizeLimit int64) error {
 	var tooBig *SizeLimitError
 	if !errors.As(err, &tooBig) {
@@ -174,8 +172,8 @@ func extractTar(dir string, body io.Reader, sizeLimit int64) (root string, writt
 		case root == "":
 			root = top
 		case top != root:
-			// One cid, one root. Only the root is moved into place, so a second one
-			// would be dropped and the download still called a success.
+			// One cid, one root. Only the root is moved into place, so a second would
+			// be dropped and the download still called a success.
 			return "", written, fmt.Errorf(
 				"gateway served an archive with more than one root entry (%q and %q)", root, top,
 			)

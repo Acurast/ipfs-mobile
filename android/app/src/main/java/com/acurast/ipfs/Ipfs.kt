@@ -43,13 +43,10 @@ public class Ipfs(
          * Resolvers used to look up addresses, for example `1.1.1.1`. Port 53
          * unless one is given.
          *
-         * Only `/dnsaddr/` entries in [bootstrapNodes] need these. Android
-         * publishes no resolver configuration for the TXT lookup they require, so
-         * something has to name the servers or such an entry resolves to nothing
-         * and its peer is never dialled. The `Ipfs(Context, ...)` factory fills
-         * this in from the active network, which is where most callers should get
-         * them; naming them here as well keeps `/dnsaddr/` working where those
-         * resolvers do not.
+         * Only `/dnsaddr/` entries in [bootstrapNodes] need these, and Android
+         * publishes none of its own, so without them such an entry resolves to
+         * nothing. The `Ipfs(Context, ...)` factory supplies the active network's;
+         * name others here to stay reachable where those are not.
          */
         val dnsServers: List<String> = emptyList(),
     )
@@ -212,13 +209,11 @@ public class Ipfs(
 
 /**
  * An [Ipfs] that can resolve the `/dnsaddr/` addresses among its bootstrap peers,
- * by naming the resolvers the active network is using.
- *
- * Prefer this over the constructor on Android. Nothing else reads those resolvers,
- * and without them a `/dnsaddr/` peer resolves to nothing and is never dialled.
+ * by naming the resolvers the active network is using. Prefer this over the
+ * constructor on Android, where nothing else supplies them.
  *
  * They are read once, here, so a client outliving the network it was built on
- * keeps that network's resolvers. Build another to pick up the current ones.
+ * keeps that network's resolvers.
  */
 public fun Ipfs(
     context: Context,

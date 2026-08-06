@@ -140,9 +140,8 @@ func TestDialAllSignalsTheFirstReachablePeer(t *testing.T) {
 }
 
 // A peer that accepts the connection and then says nothing holds its dial open
-// until libp2p gives up on it. The budget here is shorter than that, so a
-// download that waits for the dial cannot finish at all - while one that asks
-// the gateway already connected to it has time to spare.
+// until libp2p gives up. The budget here is shorter than that, so a download
+// that waits for the dial cannot finish at all.
 func TestStalledPeerDoesNotHoldUpAConnectedGateway(t *testing.T) {
 	content := testpeer.Content(4096)
 	gateway, root, _ := testpeer.ServeTrustlessGateway(t, content)

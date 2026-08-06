@@ -466,13 +466,9 @@ func TestLiveConfiguredPeersSurviveTheDHTBootstrap(t *testing.T) {
 	}
 }
 
-// A download starting while the connection table is over the high water mark,
-// which is when the connection manager is actively culling. Trimming settings
-// that look harmless against a node at rest can cut the connections a fetch in
-// flight is using, and the caller sees only a timeout.
-//
-// Measuring connection counts is not enough to catch that: a fetch issued before
-// the bootstrap burst finds nothing to trim and always passes.
+// A download starting while the connection table is over the high water mark, so
+// the connection manager is actively culling. Settings that look harmless against
+// a node at rest can cut the connections a fetch in flight is using.
 func TestLiveDownloadSurvivesConnectionTrimming(t *testing.T) {
 	peers := parsePeers(livePeers())
 	if len(peers) == 0 {
