@@ -89,6 +89,11 @@ type Client struct {
 	primaryTimeout      time.Duration
 	fallbackStepTimeout time.Duration
 
+	// retired is cancelled by Close, which the fallback watches: it holds no node,
+	// so nothing else would stop an attempt already in flight.
+	retired context.Context
+	retire  context.CancelFunc
+
 	mutex sync.Mutex
 	node  *node
 	// starting is non-nil while a node is being built, and closed once it is.
@@ -143,7 +148,11 @@ func New(config *Config) (*Client, error) {
 		return nil, errors.New("no bootstrap peers, gateways or delegated routing endpoint configured, there is nowhere to fetch from")
 	}
 
+	retired, retire := context.WithCancel(context.Background())
+
 	return &Client{
+		retired:             retired,
+		retire:              retire,
 		config:              node,
 		idle:                config.IdleTimeout,
 		gateways:            gatewayURLs,
@@ -292,7 +301,7 @@ func (client *Client) getPrimary(ctx context.Context, target cid.Cid, output str
 func awaitDownload(ctx context.Context, result <-chan error) error {
 	select {
 	case err := <-result:
-		if err != nil && ctx.Err() != nil {
+		if err != nil && ctx.Err() != nil && !conclusive(err) {
 			return contextError(ctx)
 		}
 
@@ -300,14 +309,23 @@ func awaitDownload(ctx context.Context, result <-chan error) error {
 	case <-ctx.Done():
 		select {
 		case err := <-result:
-			if err == nil {
-				return nil
+			if err == nil || conclusive(err) {
+				return err
 			}
 		default:
 		}
 
 		return contextError(ctx)
 	}
+}
+
+// conclusive reports failures that no other source would answer differently, so
+// reporting them as a timeout would send the caller looking anyway - for content
+// that will not fit, or with a client that is gone.
+func conclusive(err error) bool {
+	var tooBig *SizeLimitError
+
+	return errors.As(err, &tooBig) || errors.Is(err, ErrClosed)
 }
 
 // contextError maps a finished context onto the error the caller sees. The
@@ -332,6 +350,7 @@ func (client *Client) Close() error {
 
 	client.closed = true
 	client.stopTimer()
+	client.retire()
 
 	node := client.node
 	client.node = nil
@@ -367,6 +386,10 @@ func (client *Client) acquire(ctx context.Context) (*node, error) {
 		if client.node != nil {
 			node := client.node
 			client.inflight++
+
+			// Under the mutex: dialAll only starts the dials, and nothing else
+			// touches the groups it records.
+			node.redial(client.config)
 			client.mutex.Unlock()
 
 			return node, nil

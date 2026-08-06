@@ -39,31 +39,26 @@ func TestWithTimeoutNegativeLeavesTheCallUnbounded(t *testing.T) {
 	}
 }
 
-func TestWithTimeoutNonNegativeSetsADeadline(t *testing.T) {
-	tests := []struct {
-		name    string
-		timeout int64
-	}{
-		{"zero", 0},
-		{"positive", 5000},
-	}
+// Zero is covered by TestZeroTimeoutIsUnbounded, which is the case it belongs to.
+func TestWithTimeoutPositiveSetsADeadline(t *testing.T) {
+	for _, timeout := range []int64{1, 5000} {
+		ctx, cancel := withTimeout(timeout)
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := withTimeout(test.timeout)
-			defer cancel()
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Errorf("timeout %d produced no deadline", timeout)
+			cancel()
 
-			deadline, ok := ctx.Deadline()
-			if !ok {
-				t.Fatalf("timeout %d produced no deadline", test.timeout)
-			}
+			continue
+		}
 
-			within := time.Until(deadline)
-			want := time.Duration(test.timeout) * time.Millisecond
-			if within > want+time.Second {
-				t.Errorf("deadline is %v away, want about %v", within, want)
-			}
-		})
+		within := time.Until(deadline)
+		want := time.Duration(timeout) * time.Millisecond
+		if within > want+time.Second {
+			t.Errorf("deadline is %v away, want about %v", within, want)
+		}
+
+		cancel()
 	}
 }
 
@@ -339,5 +334,19 @@ func TestUnboundedDurationDoesNotWrap(t *testing.T) {
 	}
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 0 {
 		t.Errorf("an unbounded timeout produced a deadline in the past: %s", deadline)
+	}
+}
+
+// Every other duration here reads a non-positive value as unset, so a caller
+// leaving Timeout alone must not get a deadline that has already passed.
+func TestZeroTimeoutIsUnbounded(t *testing.T) {
+	ctx, cancel := withTimeout(0)
+	defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		t.Errorf("a zero timeout produced a context that was already done: %v", err)
+	}
+	if _, ok := ctx.Deadline(); ok {
+		t.Error("a zero timeout produced a deadline")
 	}
 }

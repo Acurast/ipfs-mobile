@@ -62,11 +62,20 @@ func (client *Client) fetchFromGateways(ctx context.Context, target cid.Cid, out
 		}
 
 		attempt, cancel := context.WithTimeout(ctx, client.fallbackStepTimeout)
+		stopWatching := context.AfterFunc(client.retired, cancel)
+
 		err := fetchFromGateway(attempt, gateway, target, output, sizeLimit)
+
+		stopWatching()
 		cancel()
 
 		if err == nil {
 			return nil
+		}
+
+		// Cancelled by Close rather than by the caller or the step budget.
+		if client.isClosed() {
+			return ErrClosed
 		}
 
 		// No other gateway returns smaller content.

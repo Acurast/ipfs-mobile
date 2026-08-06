@@ -569,3 +569,47 @@ func TestOnlyTheTransportsInUseAreStarted(t *testing.T) {
 		}
 	}
 }
+
+// A node outlives the download that started it, so one that has lost every
+// connection must dial again rather than serve the rest of its idle life with
+// nowhere to fetch from.
+func TestAPeerlessNodeDialsAgain(t *testing.T) {
+	content := testpeer.Content(1024)
+	addr, root := testpeer.Serve(t, content)
+
+	// No DHT, so nothing else would dial these peers again.
+	client := newClient(t, &Config{BootstrapPeers: []string{addr}, DisableDHT: true})
+
+	warm, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := client.Get(warm, root, filepath.Join(t.TempDir(), "first"), -1); err != nil {
+		t.Fatal(err)
+	}
+
+	client.mutex.Lock()
+	node := client.node
+	client.mutex.Unlock()
+
+	if node == nil {
+		t.Fatal("no node is running")
+	}
+
+	// Every connection dropped, as a network change does to an idle node.
+	for _, id := range node.host.Network().Peers() {
+		if err := node.host.Network().ClosePeer(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if left := len(node.host.Network().Peers()); left != 0 {
+		t.Fatalf("%d connections survived", left)
+	}
+
+	// Short enough that a node left peerless cannot pass by waiting.
+	brief, stop := context.WithTimeout(context.Background(), 15*time.Second)
+	defer stop()
+
+	if err := client.Get(brief, root, filepath.Join(t.TempDir(), "second"), -1); err != nil {
+		t.Fatalf("a download after losing every peer failed: %v", err)
+	}
+}

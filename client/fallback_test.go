@@ -320,3 +320,65 @@ func TestCloseDuringTheFallbackStopsIt(t *testing.T) {
 		t.Errorf("a closed client made %d further gateway requests", secondTar.Load())
 	}
 }
+
+// Close must reach an attempt already in flight, not only the next one: the
+// fallback holds no node, so nothing else would stop it writing output.
+func TestCloseCancelsAnAttemptInFlight(t *testing.T) {
+	var (
+		serving   = make(chan struct{})
+		cancelled = make(chan struct{})
+		client    atomic.Pointer[Client]
+	)
+
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("format") != "tar" {
+			http.Error(w, "no", http.StatusNotFound)
+			return
+		}
+
+		close(serving)
+
+		// Hold the response open. Only Close should end this.
+		<-r.Context().Done()
+		close(cancelled)
+	}))
+	t.Cleanup(gateway.Close)
+
+	built := newClient(t, &Config{
+		BootstrapPeers:                 []string{deadPeer},
+		Gateways:                       []string{gateway.URL},
+		AllowUnverifiedGatewayFallback: true,
+		PrimaryTimeout:                 time.Second,
+		// Long enough that only Close can end the attempt.
+		FallbackStepTimeout: time.Minute,
+	})
+	client.Store(built)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- built.Get(context.Background(), testpeer.UnreachableCID, filepath.Join(t.TempDir(), "out"), -1)
+	}()
+
+	select {
+	case <-serving:
+	case <-time.After(30 * time.Second):
+		t.Skip("the fallback never reached the gateway; nothing to assert")
+	}
+
+	built.Close()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrClosed) {
+			t.Errorf("err = %v, want ErrClosed", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("Close did not stop the attempt in flight")
+	}
+
+	select {
+	case <-cancelled:
+	case <-time.After(10 * time.Second):
+		t.Error("the gateway handler never saw its request cancelled")
+	}
+}

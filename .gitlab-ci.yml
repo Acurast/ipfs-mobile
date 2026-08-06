@@ -56,12 +56,26 @@ lint:
         # The published artifact is built from the Go version pinned in
         # jitpack.yml, so a standard library advisory ships with it.
         #
-        # govulncheck exits non-zero whenever it reports anything, so accepted
-        # findings are subtracted rather than the exit status trusted.
-        # GO-2024-3218 is DHT censorship by a Sybil adversary: no fix exists and
-        # it is inherent to using a DHT at all.
+        # Accepted findings are subtracted rather than the exit status trusted,
+        # since govulncheck reports one by exiting non-zero. GO-2024-3218 is DHT
+        # censorship by a Sybil adversary: no fix exists and it is inherent to
+        # using a DHT at all.
         printf "%s\n" GO-2024-3218 | sort -u > /tmp/accepted
-        govulncheck ./... 2>&1 | grep -oE "GO-[0-9]{4}-[0-9]+" | sort -u > /tmp/found || true
+
+        # 0 is a clean scan and 3 is a scan that found something. Anything else
+        # means it never ran, which must not pass for want of output.
+        set +e
+        report=$(govulncheck ./... 2>&1)
+        scan=$?
+        set -e
+
+        if [ "$scan" -ne 0 ] && [ "$scan" -ne 3 ]; then
+          echo "govulncheck did not run (exit $scan):"
+          echo "$report"
+          exit 1
+        fi
+
+        printf "%s\n" "$report" | grep -oE "GO-[0-9]{4}-[0-9]+" | sort -u > /tmp/found || true
         unexpected=$(comm -23 /tmp/found /tmp/accepted)
         if [ -n "$unexpected" ]; then
           echo "govulncheck reported findings that are not on the accepted list:"

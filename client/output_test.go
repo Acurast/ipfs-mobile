@@ -109,3 +109,34 @@ func TestOutputLocksAreIndependent(t *testing.T) {
 		t.Errorf("%d paths still tracked, want only the one still held", remaining)
 	}
 }
+
+// A download abandoned at its deadline is reported as failed, so it must not
+// publish afterwards over whatever the caller kept.
+func TestReplaceDoesNothingPastTheDeadline(t *testing.T) {
+	dir := t.TempDir()
+
+	output := filepath.Join(dir, "out")
+	if err := os.WriteFile(output, []byte("the caller's own"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	staged := filepath.Join(dir, "staged")
+	if err := os.WriteFile(staged, []byte("late arrival"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := replace(expired, staged, output); err == nil {
+		t.Error("a replace past the deadline was allowed")
+	}
+
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "the caller's own" {
+		t.Errorf("output = %q, want it untouched", got)
+	}
+}

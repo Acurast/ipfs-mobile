@@ -70,12 +70,19 @@ const (
 // node is a running libp2p host with a block exchange and a DHT, owned by
 // exactly one Client.
 type node struct {
-	cancel   context.CancelFunc
+	cancel context.CancelFunc
+	// lifetime outlives any single download and is cancelled by close, so dials
+	// started later are bounded by the node rather than by whoever asked.
+	lifetime context.Context
 	host     host.Host
 	dht      *dht.IpfsDHT
 	http     network.BitSwapNetwork
 	exchange network.BitSwapNetwork
 	bs       *bsclient.Client
+
+	// The dials last started, so a retry does not stack on one still running.
+	peerDials    *dialGroup
+	gatewayDials *dialGroup
 }
 
 // nodeConfig is everything a node needs to start.
@@ -111,7 +118,7 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	// The node outlives any single request, so its lifetime is not tied to ctx.
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
-	node := &node{cancel: cancel, host: host}
+	node := &node{cancel: cancel, lifetime: nodeCtx, host: host}
 
 	var kadFinder routing.ContentDiscovery
 
@@ -174,6 +181,8 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 
 	peers := dialAll(nodeCtx, config.peers, host.Connect, peerName)
 
+	node.gatewayDials, node.peerDials = gateways, peers
+
 	// Bitswap asks whoever is connected and asks again as others arrive, so
 	// startup only needs somewhere to send the first request.
 	awaitConnection(ctx, gateways, peers)
@@ -209,6 +218,29 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	}
 
 	return node, nil
+}
+
+// redial retries the configured peers and gateways when nothing is connected.
+//
+// A node is kept for as long as the client stays warm, and startNode hands it
+// back as soon as one dial is still in flight - so dials that then all failed,
+// or connections lost to a network change, would otherwise leave it cached with
+// nowhere to fetch from until it goes idle.
+func (node *node) redial(config nodeConfig) {
+	if len(node.host.Network().Peers()) > 0 {
+		return
+	}
+	if node.peerDials != nil && !node.peerDials.finished() {
+		return
+	}
+
+	node.peerDials = dialAll(node.lifetime, config.peers, node.host.Connect, peerName)
+
+	if node.http != nil {
+		node.gatewayDials = dialAll(node.lifetime, config.gateways, func(ctx context.Context, gateway peer.AddrInfo) error {
+			return node.http.Connect(ctx, gateway)
+		}, gatewayName)
+	}
 }
 
 // awaitConnection waits for one peer or gateway to answer, giving up once every

@@ -147,7 +147,10 @@ func Get(cid string, output string, config *Config) error {
 }
 
 func withTimeout(timeout int64) (context.Context, context.CancelFunc) {
-	if timeout < 0 || timeout > maxMilliseconds {
+	// Zero as well as negative: every other duration here reads a non-positive
+	// value as "unset", and a caller that leaves the field alone means no bound,
+	// not a deadline that has already passed.
+	if timeout <= 0 || timeout > maxMilliseconds {
 		return context.WithCancel(context.Background())
 	}
 

@@ -315,3 +315,48 @@ func TestGatewayPeerIDIsStableAndDistinct(t *testing.T) {
 		t.Error("different gateways produced the same id")
 	}
 }
+
+// A gateway that was unreachable when the node started is retried, not written
+// off for the whole time the node is kept.
+func TestAnUnreachableGatewayIsRetried(t *testing.T) {
+	content := testpeer.Content(2048)
+	gateway, root, blockRequests := testpeer.ServeTrustlessGateway(t, content)
+
+	// A peer that holds nothing, so only the gateway can answer.
+	bootstrapAddr, _, _ := testpeer.ServeIsolated(t, testpeer.Content(64))
+
+	peers := parsePeers([]string{bootstrapAddr})
+	gateways, hosts, _ := parseGateways([]string{gateway})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	node, err := startNode(ctx, nodeConfig{peers: peers, gateways: gateways, gatewayHosts: hosts, disableDHT: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.close()
+
+	// Drop the libp2p connection so the node counts as having nothing, which is
+	// what makes redial reconsider the gateway too.
+	for _, id := range node.host.Network().Peers() {
+		if err := node.host.Network().ClosePeer(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := blockRequests.Load()
+	node.redial(nodeConfig{peers: peers, gateways: gateways, gatewayHosts: hosts})
+
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := node.download(ctx, mustParseCID(t, root), filepath.Join(t.TempDir(), "out"), -1); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if blockRequests.Load() == before {
+		t.Error("the gateway was never asked again after the node lost its peers")
+	}
+}

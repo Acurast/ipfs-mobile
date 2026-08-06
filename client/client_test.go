@@ -967,3 +967,35 @@ func TestConcurrentDownloadsToOnePathAreSerialised(t *testing.T) {
 		t.Error("the content written does not match what was served")
 	}
 }
+
+// A size limit means the same whatever the clock says, so it must survive the
+// deadline: reported as a timeout it would lose its type and send the caller to
+// the fallback for content that cannot fit.
+func TestConclusiveFailuresSurviveTheDeadline(t *testing.T) {
+	// A passed deadline rather than a cancellation, which reports differently.
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	finished := func(err error) <-chan error {
+		result := make(chan error, 1)
+		result <- err
+		return result
+	}
+
+	tooBig := &SizeLimitError{Size: 100, Limit: 10}
+
+	var got *SizeLimitError
+	if err := awaitDownload(expired, finished(tooBig)); !errors.As(err, &got) {
+		t.Errorf("err = %v, want the size limit to survive the deadline", err)
+	}
+
+	if err := awaitDownload(expired, finished(ErrClosed)); !errors.Is(err, ErrClosed) {
+		t.Errorf("err = %v, want ErrClosed to survive the deadline", err)
+	}
+
+	// Anything else at an expired deadline is still a timeout.
+	if err := awaitDownload(expired, finished(errors.New("no providers"))); err == nil ||
+		err.Error() != "timeout" {
+		t.Errorf("err = %v, want it reported as a timeout", err)
+	}
+}

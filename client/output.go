@@ -11,6 +11,13 @@ import (
 // so a reader never finds the path empty; only a directory has to be cleared
 // first, which cannot be done without leaving a gap.
 func replace(ctx context.Context, staged string, output string) error {
+	// A download abandoned at its deadline has already been reported as failed,
+	// and the caller may have kept what was at output. Publishing now would take
+	// that away after the fact.
+	if ctx.Err() != nil {
+		return contextError(ctx)
+	}
+
 	if err := os.Rename(staged, output); err == nil {
 		return nil
 	}
