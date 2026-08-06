@@ -213,7 +213,7 @@ public class Ipfs internal constructor(
         get() = ipfsDir(DIR_DATA)
 
     public companion object {
-        internal const val PORT = 0
+        internal const val PORT = -1
 
         /** The FFI encodes "no limit" and "no timeout" as negative, "no endpoint" as empty. */
         private const val NO_SIZE_LIMIT = -1L

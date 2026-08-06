@@ -23,6 +23,9 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/security/noise"
 	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
+	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
+	"github.com/libp2p/go-libp2p/p2p/transport/tcp"
+	websocket "github.com/libp2p/go-libp2p/p2p/transport/websocket"
 
 	"github.com/multiformats/go-multiaddr"
 
@@ -42,13 +45,18 @@ const (
 	// carries on past it; only the waiting stops.
 	startupTimeout = 2 * time.Second
 
-	// Above the high water mark connections are trimmed back to the low one, and
-	// new ones are exempt for the grace period. Well under go-libp2p's own, which
-	// are a server's: a routing lookup fills whatever it is given, and on a phone
-	// every connection costs battery and a slot in the carrier's NAT table.
-	lowWaterConnections   = 16
-	highWaterConnections  = 32
-	connectionGracePeriod = 20 * time.Second
+	// Above the high water mark connections are trimmed back to the low one, new
+	// ones are exempt for the grace period, and the manager looks for work at the
+	// trim interval. Well under go-libp2p's own, which are a server's: a routing
+	// lookup fills whatever it is given, and on a phone every connection costs
+	// battery and a slot in the carrier's NAT table.
+	//
+	// The grace period is short enough to trim during the burst a lookup opens
+	// rather than after it has passed.
+	lowWaterConnections    = 8
+	highWaterConnections   = 16
+	connectionGracePeriod  = 2 * time.Second
+	connectionTrimInterval = 3 * time.Second
 
 	// Peers named in the configuration are the ones holding the content, so a
 	// lookup filling the connection table must not displace them.
@@ -439,13 +447,14 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 		lowWaterConnections,
 		highWaterConnections,
 		connmgr.WithGracePeriod(connectionGracePeriod),
+		connmgr.WithSilencePeriod(connectionTrimInterval),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("building the connection manager: %w", err)
 	}
 
 	opts := []libp2p.Option{
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port)),
+		listenOn(port),
 		libp2p.Identity(priv),
 		libp2p.ConnectionManager(connections),
 
@@ -455,6 +464,14 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 		// deadline may not have to spare.
 		libp2p.Security(noise.ID, noise.New),
 		libp2p.Security(libp2ptls.ID, libp2ptls.New),
+
+		// Only what the peers this dials actually offer. The defaults add
+		// WebTransport and WebRTC, and WebRTC brings a media stack that inspects
+		// network interfaces - which Android refuses an ordinary app - for a
+		// transport no configured peer advertises.
+		libp2p.Transport(tcp.NewTCPTransport),
+		libp2p.Transport(quic.NewTransport),
+		libp2p.Transport(websocket.New),
 	}
 
 	if resolver != nil {
@@ -462,6 +479,22 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 	}
 
 	return libp2p.New(opts...)
+}
+
+// listenOn opens a listener only when the caller asked for one. Nothing dials
+// this node: it fetches, the DHT runs as a client, and the address it would
+// advertise is a loopback one nobody can reach.
+//
+// Not listening also keeps libp2p from enumerating network interfaces, which it
+// does on a timer for as long as it has an address to maintain. Android refuses
+// that to an ordinary app, so every pass is a denial in the system log and an
+// error from libp2p.
+func listenOn(port int32) libp2p.Option {
+	if port <= 0 {
+		return libp2p.NoListenAddrs
+	}
+
+	return libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port))
 }
 
 // parsePeers validates bootstrap addresses when the Client is built rather than
