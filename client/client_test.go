@@ -809,3 +809,161 @@ func TestMalformedGatewayListDoesNotSinkAWorkingClient(t *testing.T) {
 		t.Errorf("kept %d gateways from a list where none is valid", len(client.config.gateways))
 	}
 }
+
+// A download that lands in the same instant the deadline does is kept, not
+// reported as a timeout.
+func TestADownloadThatBeatsTheDeadlineIsKept(t *testing.T) {
+	expired, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	finished := func(err error) <-chan error {
+		result := make(chan error, 1)
+		result <- err
+		return result
+	}
+
+	if err := awaitDownload(expired, finished(nil)); err != nil {
+		t.Errorf("a finished download was discarded at the deadline: %v", err)
+	}
+
+	// A failure at the deadline is still a timeout: the deadline is why it failed.
+	if err := awaitDownload(expired, finished(errors.New("no providers"))); err == nil {
+		t.Error("a failed download at the deadline was reported as success")
+	}
+
+	// Nothing finished, so the deadline is all there is to report.
+	if err := awaitDownload(expired, make(chan error, 1)); err == nil {
+		t.Error("an expired deadline with no result was reported as success")
+	}
+}
+
+// A gateway that failed validation must not arm the fallback, which would
+// otherwise take deadline away from the verified phase for a route that cannot
+// work.
+func TestAnInvalidGatewayDoesNotArmTheFallback(t *testing.T) {
+	addr, _ := testpeer.Serve(t, testpeer.Content(64))
+
+	client := newClient(t, &Config{
+		BootstrapPeers:                 []string{addr},
+		Gateways:                       []string{"://nonsense"},
+		AllowUnverifiedGatewayFallback: true,
+	})
+
+	if client.fallbackAvailable() {
+		t.Error("an unusable gateway armed the fallback")
+	}
+
+	// With nothing to fall back to, the primary phase keeps the whole deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	primary, stop := client.primaryDeadline(ctx)
+	defer stop()
+
+	deadline, ok := primary.Deadline()
+	if !ok {
+		t.Fatal("the primary phase has no deadline at all")
+	}
+	if remaining := time.Until(deadline); remaining < 9*time.Second {
+		t.Errorf("primary phase got %s of a 10s deadline, want all of it", remaining.Round(time.Millisecond))
+	}
+}
+
+// Building a node is expensive enough that concurrent first downloads must not
+// each build one.
+func TestConcurrentColdStartsBuildOneNode(t *testing.T) {
+	content := testpeer.Content(2048)
+	addr, root := testpeer.Serve(t, content)
+
+	client := newClient(t, &Config{BootstrapPeers: []string{addr}})
+
+	var built atomic.Int32
+	client.config.onNodeStarted = func() { built.Add(1) }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+
+	var wait sync.WaitGroup
+	errs := make([]error, 8)
+
+	for i := range errs {
+		wait.Add(1)
+		go func(i int) {
+			defer wait.Done()
+			errs[i] = client.Get(ctx, root, filepath.Join(dir, string(rune('a'+i))), -1)
+		}(i)
+	}
+	wait.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("download %d: %v", i, err)
+		}
+	}
+
+	if got := built.Load(); got != 1 {
+		t.Errorf("%d nodes were built for %d concurrent first downloads, want 1", got, len(errs))
+	}
+}
+
+// Downloads of one cid share an output path by default, and replacing it must
+// not leave a reader with nothing there.
+func TestConcurrentDownloadsToOnePathAreSerialised(t *testing.T) {
+	content := testpeer.Content(4096)
+	addr, root := testpeer.Serve(t, content)
+
+	client := newClient(t, &Config{BootstrapPeers: []string{addr}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	output := filepath.Join(t.TempDir(), "out")
+
+	// A reader running throughout: once the path exists it must never stop
+	// existing, however many writers replace it.
+	watching := make(chan struct{})
+	var vanished atomic.Int32
+
+	go func() {
+		defer close(watching)
+
+		seen := false
+		for range 4000 {
+			_, err := os.Stat(output)
+			switch {
+			case err == nil:
+				seen = true
+			case seen:
+				vanished.Add(1)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	var wait sync.WaitGroup
+	for range 6 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if err := client.Get(ctx, root, output, -1); err != nil {
+				t.Errorf("Get: %v", err)
+			}
+		}()
+	}
+	wait.Wait()
+	<-watching
+
+	if got := vanished.Load(); got != 0 {
+		t.Errorf("the output path disappeared %d times while being replaced", got)
+	}
+
+	written, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(written, content) {
+		t.Error("the content written does not match what was served")
+	}
+}

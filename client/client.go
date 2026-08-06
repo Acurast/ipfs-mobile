@@ -89,8 +89,10 @@ type Client struct {
 	primaryTimeout      time.Duration
 	fallbackStepTimeout time.Duration
 
-	mutex    sync.Mutex
-	node     *node
+	mutex sync.Mutex
+	node  *node
+	// starting is non-nil while a node is being built, and closed once it is.
+	starting chan struct{}
 	inflight int
 	timer    *time.Timer
 	closed   bool
@@ -101,7 +103,7 @@ type Client struct {
 func New(config *Config) (*Client, error) {
 	peers := parsePeers(config.BootstrapPeers)
 
-	gateways, gatewayHosts := parseGateways(config.Gateways)
+	gateways, gatewayHosts, gatewayURLs := parseGateways(config.Gateways)
 
 	resolver, err := newResolver(config.DNSServers)
 	if err != nil {
@@ -144,7 +146,7 @@ func New(config *Config) (*Client, error) {
 	return &Client{
 		config:              node,
 		idle:                config.IdleTimeout,
-		gateways:            config.Gateways,
+		gateways:            gatewayURLs,
 		allowUnverified:     config.AllowUnverifiedGatewayFallback,
 		primaryTimeout:      orDefault(config.PrimaryTimeout, defaultPrimaryTimeout),
 		fallbackStepTimeout: orDefault(config.FallbackStepTimeout, defaultFallbackStepTimeout),
@@ -166,7 +168,8 @@ func orDefault(configured time.Duration, fallback time.Duration) time.Duration {
 // block. Only once that fails, and Config.AllowUnverifiedGatewayFallback is set,
 // does it fall back to an unverified gateway fetch.
 //
-// On success output is replaced, whether or not something was already there.
+// On success output is replaced, and a directory already at that path is
+// removed to make room for it.
 func (client *Client) Get(ctx context.Context, cidStr string, output string, sizeLimit int64) error {
 	// Parsed before either path runs, and passed down as a value from here on.
 	// Both paths derive a filesystem path or a URL from it, and neither is safe
@@ -280,16 +283,29 @@ func (client *Client) getPrimary(ctx context.Context, target cid.Cid, output str
 		result <- node.download(ctx, target, output, sizeLimit)
 	}()
 
+	return awaitDownload(ctx, result)
+}
+
+// awaitDownload waits for the download or the deadline, preferring a download
+// that finished: when both are ready select would pick at random, and content
+// already written and verified is worth more than the deadline it arrived on.
+func awaitDownload(ctx context.Context, result <-chan error) error {
 	select {
 	case err := <-result:
-		// When the deadline expires both cases are ready and select would pick at
-		// random, so decide on ctx rather than on which channel won.
 		if err != nil && ctx.Err() != nil {
 			return contextError(ctx)
 		}
 
 		return err
 	case <-ctx.Done():
+		select {
+		case err := <-result:
+			if err == nil {
+				return nil
+			}
+		default:
+		}
+
 		return contextError(ctx)
 	}
 }
@@ -333,54 +349,71 @@ func (client *Client) Close() error {
 
 // acquire returns a running node, starting one if necessary, and records that a
 // download is using it so the idle timer cannot close it mid-flight.
+// acquire returns the running node, starting it if this is the first download.
+// One caller starts it and the rest wait, since building several to discard all
+// but one is expensive on a phone. A waiter left without a node starts one
+// itself, so nobody inherits another caller's deadline.
 func (client *Client) acquire(ctx context.Context) (*node, error) {
-	client.mutex.Lock()
+	for {
+		client.mutex.Lock()
 
-	if client.closed {
-		client.mutex.Unlock()
-		return nil, ErrClosed
-	}
+		if client.closed {
+			client.mutex.Unlock()
+			return nil, ErrClosed
+		}
 
-	client.stopTimer()
+		client.stopTimer()
 
-	if client.node != nil {
-		node := client.node
+		if client.node != nil {
+			node := client.node
+			client.inflight++
+			client.mutex.Unlock()
+
+			return node, nil
+		}
+
+		if pending := client.starting; pending != nil {
+			client.mutex.Unlock()
+
+			select {
+			case <-pending:
+			case <-ctx.Done():
+				return nil, contextError(ctx)
+			}
+
+			continue
+		}
+
+		// Claimed before unlocking, so a concurrent Close or idle sweep sees the
+		// download and leaves the node alone.
+		pending := make(chan struct{})
+		client.starting = pending
 		client.inflight++
 		client.mutex.Unlock()
 
-		return node, nil
-	}
+		node, err := startNode(ctx, client.config)
 
-	// Claimed before unlocking, so a concurrent Close or idle sweep sees the
-	// download and leaves the node alone.
-	client.inflight++
-	client.mutex.Unlock()
-
-	node, err := startNode(ctx, client.config)
-	if err != nil {
-		client.release()
-		return nil, err
-	}
-
-	client.mutex.Lock()
-
-	switch {
-	case client.closed:
+		client.mutex.Lock()
+		client.starting = nil
+		closed := client.closed
+		if err == nil && !closed {
+			client.node = node
+		}
 		client.mutex.Unlock()
-		node.close()
-		client.release()
 
-		return nil, ErrClosed
-	case client.node != nil:
-		// Another download started one first. Keep theirs.
-		existing := client.node
-		client.mutex.Unlock()
-		node.close()
+		// Only once the outcome is recorded, so a waiter waking up sees it.
+		close(pending)
 
-		return existing, nil
-	default:
-		client.node = node
-		client.mutex.Unlock()
+		if err != nil {
+			client.release()
+			return nil, err
+		}
+		if closed {
+			node.close()
+			client.release()
+
+			return nil, ErrClosed
+		}
 
 		return node, nil
 	}

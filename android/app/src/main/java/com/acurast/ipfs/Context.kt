@@ -10,15 +10,15 @@ import android.net.ConnectivityManager
 internal val Context.dnsServers: List<String>
     get() {
         val manager = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
-        val active = manager.activeNetwork ?: return emptyList()
 
         // The manifest asks for ACCESS_NETWORK_STATE, but an app is free to drop
         // what a library merged into it.
-        val properties = try {
-            manager.getLinkProperties(active)
-        } catch (e: SecurityException) {
-            null
-        } ?: return emptyList()
+        return try {
+            val active = manager.activeNetwork ?: return emptyList()
+            val properties = manager.getLinkProperties(active) ?: return emptyList()
 
-        return properties.dnsServers.mapNotNull { it.hostAddress }
+            properties.dnsServers.mapNotNull { it.hostAddress }
+        } catch (e: SecurityException) {
+            emptyList()
+        }
     }

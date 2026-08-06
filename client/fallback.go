@@ -136,11 +136,7 @@ func fetchFromGateway(ctx context.Context, gateway string, target cid.Cid, outpu
 
 	fmt.Printf("fetched %s from gateway %s unverified (%d bytes)\n", target, gateway, written)
 
-	if err := os.RemoveAll(output); err != nil {
-		return err
-	}
-
-	return os.Rename(staged, output)
+	return replace(ctx, staged, output)
 }
 
 // extractTar unpacks the archive into dir and returns the path of its single

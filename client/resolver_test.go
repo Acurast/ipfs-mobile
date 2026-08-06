@@ -152,3 +152,24 @@ func questionName(query []byte) string {
 
 	return strings.Join(labels, ".")
 }
+
+// Host lookups stay with the platform; only TXT is diverted.
+func TestOnlyTXTLookupsUseTheConfiguredServers(t *testing.T) {
+	server, queried := stubDNS(t)
+
+	resolver, err := newResolver([]string{server})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resolver.ResolveDNSComponent(ctx, ma.StringCast("/dns4/example.invalid"), 8)
+
+	select {
+	case name := <-queried:
+		t.Errorf("a host lookup was sent to the configured server (asked for %q)", name)
+	case <-time.After(2 * time.Second):
+	}
+}

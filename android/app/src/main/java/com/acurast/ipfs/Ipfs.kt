@@ -32,6 +32,12 @@ public class Ipfs(
         val bootstrapNodes: List<String> = emptyList(),
 
         /**
+         * Whether to look providers up in the DHT. Off leaves only the peers named
+         * here and whatever [delegated] finds.
+         */
+        val dht: Boolean = true,
+
+        /**
          * A delegated routing v1 endpoint such as `https://cid.contact`, queried
          * alongside the DHT. It finds content that is indexed but never announced
          * to the DHT; in exchange the endpoint learns which CIDs this device
@@ -165,6 +171,7 @@ public class Ipfs(
             ClientConfig().also {
                 it.bootstrapPeers = routing.bootstrapNodes.joinToString(DELIMITER_LIST_STRING)
                 it.dnsServers = routing.dnsServers.joinToString(DELIMITER_LIST_STRING)
+                it.disableDHT = !routing.dht
                 it.delegatedRouting = routing.delegated ?: NO_DELEGATED_ROUTING
                 it.gateways = gateways.urls.joinToString(DELIMITER_LIST_STRING)
                 it.allowUnverifiedGatewayFallback = gateways.allowUnverifiedFallback

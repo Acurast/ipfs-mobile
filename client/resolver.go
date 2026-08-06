@@ -15,13 +15,12 @@ import (
 
 const dnsPort = "53"
 
-// newResolver builds the resolver libp2p resolves addresses with, querying the
-// given servers directly. None returns none, leaving libp2p its own.
+// newResolver builds the resolver libp2p resolves addresses with. None returns
+// none, leaving libp2p its own.
 //
 // A /dnsaddr/ address needs a TXT lookup, and Android publishes no resolver
 // configuration to build one from - plain host lookups go through the platform
-// and survive, TXT ones do not. Naming the servers is what makes such an address
-// resolvable at all.
+// and survive, TXT ones do not. Only those are sent to the given servers.
 func newResolver(servers []string) (network.MultiaddrDNSResolver, error) {
 	if len(servers) == 0 {
 		return nil, nil
@@ -64,12 +63,27 @@ func newResolver(servers []string) (network.MultiaddrDNSResolver, error) {
 		},
 	}
 
-	resolver, err := madns.NewResolver(madns.WithDefaultResolver(basic))
+	resolver, err := madns.NewResolver(madns.WithDefaultResolver(txtOverride{servers: basic}))
 	if err != nil {
 		return nil, err
 	}
 
 	return swarm.ResolverFromMaDNS{Resolver: resolver}, nil
+}
+
+// txtOverride sends TXT lookups to the servers it was given and leaves the rest
+// to the platform, which answers those and honours the system's own settings -
+// private DNS among them.
+type txtOverride struct {
+	servers *net.Resolver
+}
+
+func (resolver txtOverride) LookupTXT(ctx context.Context, name string) ([]string, error) {
+	return resolver.servers.LookupTXT(ctx, name)
+}
+
+func (resolver txtOverride) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
 }
 
 // dnsServerAddr normalises a server to host:port. The platform reports bare

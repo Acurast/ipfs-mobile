@@ -2,6 +2,7 @@ package ffi
 
 import (
 	"bytes"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -321,5 +322,22 @@ func TestMilliseconds(t *testing.T) {
 		if got := milliseconds(test.value); got != test.want {
 			t.Errorf("milliseconds(%d) = %v, want %v", test.value, got, test.want)
 		}
+	}
+}
+
+// An unbounded Kotlin Duration must not wrap into an expired context.
+func TestUnboundedDurationDoesNotWrap(t *testing.T) {
+	if got := milliseconds(math.MaxInt64); got <= 0 {
+		t.Errorf("milliseconds(MaxInt64) = %s, want a positive duration", got)
+	}
+
+	ctx, cancel := withTimeout(math.MaxInt64)
+	defer cancel()
+
+	if err := ctx.Err(); err != nil {
+		t.Errorf("an unbounded timeout produced a context that was already done: %v", err)
+	}
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= 0 {
+		t.Errorf("an unbounded timeout produced a deadline in the past: %s", deadline)
 	}
 }

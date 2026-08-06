@@ -87,6 +87,9 @@ type nodeConfig struct {
 
 	// resolver is what libp2p resolves addresses with. Nil leaves it its own.
 	resolver libp2pnet.MultiaddrDNSResolver
+
+	// onNodeStarted fires once a host is built, which tests count.
+	onNodeStarted func()
 }
 
 // startNode brings up a host and gives its dials a short head start, bounded by
@@ -193,6 +196,10 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 		go node.bootstrapDHT(nodeCtx)
 	}
 
+	if config.onNodeStarted != nil {
+		config.onNodeStarted()
+	}
+
 	return node, nil
 }
 
@@ -270,11 +277,7 @@ func (node *node) download(ctx context.Context, target cid.Cid, output string, s
 		return err
 	}
 
-	if err := os.RemoveAll(output); err != nil {
-		return err
-	}
-
-	return os.Rename(staged, output)
+	return replace(ctx, staged, output)
 }
 
 const scratchPrefix = ".ipfs-download-"
@@ -551,7 +554,7 @@ func dialAll(
 			defer wait.Done()
 
 			if err := connect(ctx, target); err != nil {
-				fmt.Printf("failed to connect to %s: %s\n", name(target), err)
+				reportOnce(name(target), err)
 				return
 			}
 
@@ -566,6 +569,21 @@ func dialAll(
 	}()
 
 	return group
+}
+
+// Targets already reported as unreachable. A gateway that cannot serve verified
+// blocks fails on every node start, and a node starts whenever the client has
+// been idle, so saying it once keeps a standing condition from reading as a
+// recurring incident. Keyed on the target, since the message varies between
+// attempts.
+var reported sync.Map
+
+func reportOnce(subject string, err error) {
+	if _, seen := reported.LoadOrStore(subject, struct{}{}); seen {
+		return
+	}
+
+	fmt.Printf("failed to connect to %s: %s\n", subject, err)
 }
 
 // gatewayName renders a gateway for logs, where its synthetic peer ID would be

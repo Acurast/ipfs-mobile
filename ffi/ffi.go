@@ -2,6 +2,7 @@ package ffi
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"ipfs-mobile/client"
@@ -27,6 +28,10 @@ type ClientConfig struct {
 	// among them, where those addresses are otherwise unresolvable. Empty uses
 	// whatever the platform offers.
 	DNSServers string
+
+	// DisableDHT turns off DHT provider lookups, leaving only directly connected
+	// peers and whatever DelegatedRouting finds.
+	DisableDHT bool
 
 	// DelegatedRouting is a delegated routing v1 endpoint such as
 	// "https://cid.contact", queried alongside the DHT. It finds content that is
@@ -63,6 +68,7 @@ type Config struct {
 	Timeout        int64
 
 	// As described on ClientConfig.
+	DisableDHT                     bool
 	DelegatedRouting               string
 	Gateways                       string
 	DNSServers                     string
@@ -77,6 +83,7 @@ func (config *Config) clientConfig() *ClientConfig {
 		Port:                           config.Port,
 		Gateways:                       config.Gateways,
 		DNSServers:                     config.DNSServers,
+		DisableDHT:                     config.DisableDHT,
 		DelegatedRouting:               config.DelegatedRouting,
 		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,
 		PrimaryTimeout:                 config.PrimaryTimeout,
@@ -99,6 +106,7 @@ func NewClient(config *ClientConfig) (*Client, error) {
 		Port:                           config.Port,
 		Gateways:                       utils.GetStringSlice(config.Gateways),
 		DNSServers:                     utils.GetStringSlice(config.DNSServers),
+		DisableDHT:                     config.DisableDHT,
 		DelegatedRoutingEndpoint:       config.DelegatedRouting,
 		IdleTimeout:                    milliseconds(config.IdleTimeout),
 		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,
@@ -139,18 +147,26 @@ func Get(cid string, output string, config *Config) error {
 }
 
 func withTimeout(timeout int64) (context.Context, context.CancelFunc) {
-	if timeout < 0 {
+	if timeout < 0 || timeout > maxMilliseconds {
 		return context.WithCancel(context.Background())
 	}
 
 	return context.WithTimeout(context.Background(), time.Duration(timeout)*time.Millisecond)
 }
 
+// The largest number of milliseconds a time.Duration can hold. Kotlin renders an
+// unbounded Duration as the largest int64 there is, which would otherwise wrap to
+// a negative duration and expire on arrival.
+const maxMilliseconds = int64(math.MaxInt64) / int64(time.Millisecond)
+
 // milliseconds converts an FFI duration, leaving a non-positive value alone so
 // the client applies its own default.
 func milliseconds(value int64) time.Duration {
 	if value <= 0 {
 		return 0
+	}
+	if value > maxMilliseconds {
+		return time.Duration(math.MaxInt64)
 	}
 
 	return time.Duration(value) * time.Millisecond

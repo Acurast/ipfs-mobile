@@ -3,11 +3,13 @@ package client
 import (
 	"bytes"
 	"context"
+	"io"
 	"ipfs-mobile/internal/testpeer"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -412,5 +414,78 @@ func TestNoiseIsProposedBeforeTLS(t *testing.T) {
 		if security := conn.ConnState().Security; security != "/noise" {
 			t.Errorf("negotiated %s, want /noise to have been proposed first", security)
 		}
+	}
+}
+
+// A target that fails on every node start is only worth reporting once.
+func TestARepeatedConnectFailureIsReportedOnce(t *testing.T) {
+	peers := parsePeers([]string{deadPeer})
+
+	// Reports are remembered for the life of the process, so another test dialling
+	// this peer first would already have spent the one this asserts on.
+	reported.Range(func(key, _ any) bool {
+		reported.Delete(key)
+
+		return true
+	})
+
+	host, err := makeHost(0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+
+	captured, restore := captureStdout(t)
+	defer restore()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	for range 3 {
+		group := dialAll(ctx, peers, host.Connect, peerName)
+		select {
+		case <-group.done:
+		case <-ctx.Done():
+			t.Fatal("the dial never settled")
+		}
+	}
+
+	restore()
+
+	if got := strings.Count(captured.String(), "failed to connect to peer"); got != 1 {
+		t.Errorf("the same failure was reported %d times, want 1:\n%s", got, captured.String())
+	}
+}
+
+// captureStdout redirects stdout until the returned function is called, which is
+// safe to call more than once.
+func captureStdout(t *testing.T) (*bytes.Buffer, func()) {
+	t.Helper()
+
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := os.Stdout
+	os.Stdout = write
+
+	captured := &bytes.Buffer{}
+	done := make(chan struct{})
+
+	go func() {
+		io.Copy(captured, read)
+		close(done)
+	}()
+
+	var once sync.Once
+
+	return captured, func() {
+		once.Do(func() {
+			os.Stdout = original
+			write.Close()
+			<-done
+			read.Close()
+		})
 	}
 }
