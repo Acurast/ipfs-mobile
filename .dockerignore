@@ -13,6 +13,7 @@ android/ffi/*.aar
 android/ffi/*.jar
 *.aar
 *.apk
+IPFS.xcframework
 
 # Local configuration and anything resembling a secret
 **/local.properties

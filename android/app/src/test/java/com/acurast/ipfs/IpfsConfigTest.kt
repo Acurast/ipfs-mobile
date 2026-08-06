@@ -37,6 +37,34 @@ class IpfsConfigTest {
         )
     }
 
+    /**
+     * What the `Ipfs(Context, ...)` factory does with the resolvers it reads, minus
+     * the reading, which needs a device.
+     */
+    @Test
+    fun configuredDnsServersComeBeforeTheOnesAddedToThem() {
+        val configured = Ipfs.Routing(dnsServers = listOf("1.1.1.1"))
+
+        assertEquals(
+            listOf("1.1.1.1", "192.168.1.1"),
+            configured.withDnsServers(listOf("192.168.1.1", "1.1.1.1")).dnsServers,
+        )
+    }
+
+    @Test
+    fun addedDnsServersAreUsedWhenNoneWereConfigured() {
+        assertEquals(
+            listOf("192.168.1.1"),
+            Ipfs.Routing().withDnsServers(listOf("192.168.1.1")).dnsServers,
+        )
+    }
+
+    /** The plain constructor stays free of any device lookup. */
+    @Test
+    fun theConstructorReadsNoResolvers() {
+        assertEquals(emptyList<String>(), Ipfs.Routing().dnsServers)
+    }
+
     @Test
     fun defaultsAreConservative() {
         assertEquals(30.seconds, Ipfs.Timeouts().idle)

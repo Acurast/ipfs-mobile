@@ -3,6 +3,7 @@ package client
 import (
 	"archive/tar"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -25,6 +26,19 @@ type SizeLimitError struct {
 	Limit int64
 }
 
+// sizeLimitWithTotals restates a size limit error in the caller's terms.
+// writeLimited is handed whatever is left of the budget, so on its own it
+// reports the residual as the limit and one entry's bytes as the size - neither
+// of which is what the caller asked for.
+func sizeLimitWithTotals(err error, written int64, sizeLimit int64) error {
+	var tooBig *SizeLimitError
+	if !errors.As(err, &tooBig) {
+		return err
+	}
+
+	return &SizeLimitError{Size: written, Limit: sizeLimit}
+}
+
 func (err *SizeLimitError) Error() string {
 	return fmt.Sprintf("size limit exceeded (actual size = %d limit = %d bytes)", err.Size, err.Limit)
 }
@@ -43,6 +57,12 @@ func (client *Client) fetchFromGateways(ctx context.Context, target cid.Cid, out
 	failures := make([]string, 0, len(client.gateways))
 
 	for _, gateway := range client.gateways {
+		// Re-checked per attempt rather than once: a Close landing mid-run should
+		// cost at most the attempt already in flight.
+		if client.isClosed() {
+			return ErrClosed
+		}
+
 		attempt, cancel := context.WithTimeout(ctx, client.fallbackStepTimeout)
 		err := fetchFromGateway(attempt, gateway, target, output, sizeLimit)
 		cancel()
@@ -105,11 +125,11 @@ func fetchFromGateway(ctx context.Context, gateway string, target cid.Cid, outpu
 
 	sweepScratchPrefix(filepath.Dir(output), gatewayScratchPrefix)
 
-	scratch, err := os.MkdirTemp(filepath.Dir(output), gatewayScratchPrefix)
+	scratch, release, err := claimScratch(filepath.Dir(output), gatewayScratchPrefix)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(scratch)
+	defer release()
 
 	staged, written, err := extractTar(scratch, response.Body, sizeLimit)
 	if err != nil {
@@ -150,8 +170,15 @@ func extractTar(dir string, body io.Reader, sizeLimit int64) (root string, writt
 
 		// The top level component, not the first entry: entries arrive in whatever
 		// order the archive lists them, so the first one may be a nested file.
-		if root == "" {
+		switch {
+		case root == "":
 			root = top
+		case top != root:
+			// One cid, one root. Only the root is moved into place, so a second one
+			// would be dropped and the download still called a success.
+			return "", written, fmt.Errorf(
+				"gateway served an archive with more than one root entry (%q and %q)", root, top,
+			)
 		}
 
 		switch header.Typeflag {
@@ -172,7 +199,7 @@ func extractTar(dir string, body io.Reader, sizeLimit int64) (root string, writt
 			count, err := writeLimited(path, archive, remaining)
 			written += count
 			if err != nil {
-				return "", written, err
+				return "", written, sizeLimitWithTotals(err, written, sizeLimit)
 			}
 		default:
 			return "", written, fmt.Errorf("unsupported tar entry %q of type %d", header.Name, header.Typeflag)

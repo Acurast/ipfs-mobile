@@ -14,12 +14,19 @@ import (
 // integers and booleans, so every option would otherwise be another positional
 // argument at the call site.
 //
-// bootstrapPeers and gateways are ";" separated lists. Durations are in
+// bootstrapPeers, gateways and dnsServers are ";" separated lists. Durations are in
 // milliseconds, and zero or negative selects the documented default.
 type ClientConfig struct {
 	BootstrapPeers string
 	Port           int32
 	Gateways       string
+
+	// DNSServers are the resolvers used to look up addresses, for example
+	// "1.1.1.1". Only /dnsaddr/ bootstrap addresses need them, and only on
+	// platforms that publish no resolver configuration of their own - Android
+	// among them, where those addresses are otherwise unresolvable. Empty uses
+	// whatever the platform offers.
+	DNSServers string
 
 	// DelegatedRouting is a delegated routing v1 endpoint such as
 	// "https://cid.contact", queried alongside the DHT. It finds content that is
@@ -58,6 +65,7 @@ type Config struct {
 	// As described on ClientConfig.
 	DelegatedRouting               string
 	Gateways                       string
+	DNSServers                     string
 	AllowUnverifiedGatewayFallback bool
 	PrimaryTimeout                 int64
 	FallbackStepTimeout            int64
@@ -68,6 +76,7 @@ func (config *Config) clientConfig() *ClientConfig {
 		BootstrapPeers:                 config.BootstrapPeers,
 		Port:                           config.Port,
 		Gateways:                       config.Gateways,
+		DNSServers:                     config.DNSServers,
 		DelegatedRouting:               config.DelegatedRouting,
 		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,
 		PrimaryTimeout:                 config.PrimaryTimeout,
@@ -89,6 +98,7 @@ func NewClient(config *ClientConfig) (*Client, error) {
 		BootstrapPeers:                 utils.GetStringSlice(config.BootstrapPeers),
 		Port:                           config.Port,
 		Gateways:                       utils.GetStringSlice(config.Gateways),
+		DNSServers:                     utils.GetStringSlice(config.DNSServers),
 		DelegatedRoutingEndpoint:       config.DelegatedRouting,
 		IdleTimeout:                    milliseconds(config.IdleTimeout),
 		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,

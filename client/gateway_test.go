@@ -247,17 +247,10 @@ func TestFallbackFailureReportsBothCauses(t *testing.T) {
 	}
 }
 
-func TestNewRejectsUnusableGatewayList(t *testing.T) {
-	addr, _ := testpeer.Serve(t, testpeer.Content(64))
-
-	_, err := New(&Config{
-		BootstrapPeers: []string{addr},
-		Gateways:       []string{"://nonsense", "ftp://wrong-scheme.example"},
-	})
-	if err == nil {
-		t.Fatal("expected an entirely invalid gateway list to be rejected")
-	}
-}
+// An entirely invalid gateway list is a configuration mistake, but on its own it
+// is not fatal: see TestMalformedGatewayListDoesNotSinkAWorkingClient, which
+// covers the case where peers still provide a route. It only fails the build
+// when nothing else does, which TestNewRejectsUnusableBootstrapLists covers.
 
 func TestNewSkipsInvalidGatewaysButKeepsValidOnes(t *testing.T) {
 	content := testpeer.Content(1024)

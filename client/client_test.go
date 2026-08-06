@@ -245,7 +245,7 @@ func TestGetFailsFastWhenNoPeerIsReachable(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
-	if !strings.Contains(err.Error(), "failed to connect to any") {
+	if !strings.Contains(err.Error(), "could be reached") {
 		t.Errorf("err = %v, want it to name the connection failure", err)
 	}
 	if elapsed > timeout/2 {
@@ -475,8 +475,8 @@ func TestNewRejectsUnusableBootstrapLists(t *testing.T) {
 		want  string
 	}{
 		{"empty", []string{}, "nowhere to fetch from"},
-		{"all invalid", []string{"", "not-a-multiaddr"}, "none of the 2 configured bootstrap peers"},
-		{"missing peer id", []string{"/ip4/127.0.0.1/tcp/4001"}, "none of the 1 configured bootstrap peers"},
+		{"all invalid", []string{"", "not-a-multiaddr"}, "none of the 2 configured"},
+		{"missing peer id", []string{"/ip4/127.0.0.1/tcp/4001"}, "none of the 1 configured"},
 	}
 
 	for _, test := range tests {
@@ -753,5 +753,59 @@ func TestGetReplacesExistingOutput(t *testing.T) {
 	}
 	if !bytes.Equal(got, content) {
 		t.Error("output was not replaced with the downloaded content")
+	}
+}
+
+// A bootstrap list that is entirely malformed is a configuration mistake, but it
+// is not a reason to refuse a client whose gateways are fine. Where gateways are
+// the only route available, failing here would take that away too.
+func TestMalformedBootstrapListDoesNotSinkAWorkingClient(t *testing.T) {
+	gateway := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nothing here", http.StatusNotFound)
+	}))
+	t.Cleanup(gateway.Close)
+
+	client, err := New(&Config{
+		BootstrapPeers: []string{"not-a-multiaddr", "/ip4/127.0.0.1/tcp/1"},
+		Gateways:       []string{gateway.URL},
+	})
+	if err != nil {
+		t.Fatalf("a client with working gateways was refused: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	if len(client.config.peers) != 0 {
+		t.Errorf("kept %d peers from a list where none is valid", len(client.config.peers))
+	}
+}
+
+// With nothing else configured, the same list leaves nowhere to fetch from, and
+// that is still an error.
+func TestMalformedBootstrapListAloneIsStillRefused(t *testing.T) {
+	_, err := New(&Config{BootstrapPeers: []string{"not-a-multiaddr"}})
+	if err == nil {
+		t.Fatal("a client with no usable route was accepted")
+	}
+	if !strings.Contains(err.Error(), "nowhere to fetch from") {
+		t.Errorf("err = %v, want it to report that there is nowhere to fetch from", err)
+	}
+}
+
+// The same tolerance the other way round: an unusable gateway list must not take
+// away peers that work.
+func TestMalformedGatewayListDoesNotSinkAWorkingClient(t *testing.T) {
+	addr, _ := testpeer.Serve(t, testpeer.Content(64))
+
+	client, err := New(&Config{
+		BootstrapPeers: []string{addr},
+		Gateways:       []string{"not a url", "://also-not"},
+	})
+	if err != nil {
+		t.Fatalf("a client with working peers was refused: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	if len(client.config.gateways) != 0 {
+		t.Errorf("kept %d gateways from a list where none is valid", len(client.config.gateways))
 	}
 }

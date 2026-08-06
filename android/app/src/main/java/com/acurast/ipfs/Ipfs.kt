@@ -38,6 +38,20 @@ public class Ipfs(
          * fetches. `null` disables it.
          */
         val delegated: String? = null,
+
+        /**
+         * Resolvers used to look up addresses, for example `1.1.1.1`. Port 53
+         * unless one is given.
+         *
+         * Only `/dnsaddr/` entries in [bootstrapNodes] need these. Android
+         * publishes no resolver configuration for the TXT lookup they require, so
+         * something has to name the servers or such an entry resolves to nothing
+         * and its peer is never dialled. The `Ipfs(Context, ...)` factory fills
+         * this in from the active network, which is where most callers should get
+         * them; naming them here as well keeps `/dnsaddr/` working where those
+         * resolvers do not.
+         */
+        val dnsServers: List<String> = emptyList(),
     )
 
     /** HTTP gateways, and how far to trust them. */
@@ -105,23 +119,28 @@ public class Ipfs(
     public suspend fun get(cid: String, context: Context, sizeLimit: Long? = null, timeout: Duration? = null): File =
         get(cid, File(context.ipfsDataDir, cid), sizeLimit, timeout)
 
-    public suspend fun get(cid: String, output: File, sizeLimit: Long? = null, timeout: Duration? = null): File = withContext(Dispatchers.IO) {
-        try {
-            client().get(
-                cid,
-                output.absolutePath,
-                sizeLimit ?: NO_SIZE_LIMIT,
-                timeout?.inWholeMilliseconds ?: NO_TIMEOUT,
-            )
+    public suspend fun get(cid: String, output: File, sizeLimit: Long? = null, timeout: Duration? = null): File =
+        withContext(Dispatchers.IO) {
+            try {
+                client().get(
+                    cid,
+                    output.absolutePath,
+                    sizeLimit ?: NO_SIZE_LIMIT,
+                    timeout?.inWholeMilliseconds ?: NO_TIMEOUT,
+                )
 
-            output
-        } catch (e: Throwable) {
-            when {
-                e.message?.startsWith("size limit exceeded") == true -> throw SizeLimitExceededException(e.message, e.cause)
-                else -> throw IOException(e.message, e.cause)
+                output
+            } catch (e: Throwable) {
+                when {
+                    e.message?.startsWith("size limit exceeded") == true -> throw SizeLimitExceededException(
+                        e.message,
+                        e.cause
+                    )
+
+                    else -> throw IOException(e.message, e.cause)
+                }
             }
         }
-    }
 
     /**
      * Shuts the node down and retires this client. Safe to call more than once,
@@ -148,6 +167,7 @@ public class Ipfs(
         client ?: Ffi.newClient(
             ClientConfig().also {
                 it.bootstrapPeers = routing.bootstrapNodes.joinToString(DELIMITER_LIST_STRING)
+                it.dnsServers = routing.dnsServers.joinToString(DELIMITER_LIST_STRING)
                 it.delegatedRouting = routing.delegated ?: NO_DELEGATED_ROUTING
                 it.gateways = gateways.urls.joinToString(DELIMITER_LIST_STRING)
                 it.allowUnverifiedGatewayFallback = gateways.allowUnverifiedFallback
@@ -173,7 +193,7 @@ public class Ipfs(
         get() = ipfsDir(DIR_DATA)
 
     public companion object {
-        private const val PORT = 0
+        internal const val PORT = 0
 
         /** The FFI encodes "no limit" and "no timeout" as negative, "no endpoint" as empty. */
         private const val NO_SIZE_LIMIT = -1L
@@ -189,3 +209,30 @@ public class Ipfs(
         private const val DELIMITER_LIST_STRING = ";"
     }
 }
+
+/**
+ * An [Ipfs] that can resolve the `/dnsaddr/` addresses among its bootstrap peers,
+ * by naming the resolvers the active network is using.
+ *
+ * Prefer this over the constructor on Android. Nothing else reads those resolvers,
+ * and without them a `/dnsaddr/` peer resolves to nothing and is never dialled.
+ *
+ * They are read once, here, so a client outliving the network it was built on
+ * keeps that network's resolvers. Build another to pick up the current ones.
+ */
+public fun Ipfs(
+    context: Context,
+    routing: Ipfs.Routing = Ipfs.Routing(),
+    gateways: Ipfs.Gateways = Ipfs.Gateways(),
+    timeouts: Ipfs.Timeouts = Ipfs.Timeouts(),
+    port: Int = Ipfs.PORT,
+): Ipfs = Ipfs(routing.withDnsServers(context.dnsServers), gateways, timeouts, port)
+
+/** Bootstrap peers alone, which is the common case. */
+public fun Ipfs(context: Context, bootstrapNodes: List<String>): Ipfs =
+    Ipfs(context, routing = Ipfs.Routing(bootstrapNodes))
+
+// Configured resolvers first, so a caller that named one is not left behind
+// whatever the network reports.
+internal fun Ipfs.Routing.withDnsServers(servers: List<String>): Ipfs.Routing =
+    copy(dnsServers = (dnsServers + servers).distinct())

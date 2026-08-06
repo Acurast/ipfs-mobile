@@ -40,6 +40,15 @@ type Config struct {
 	// endpoint learns which CIDs are fetched, and by whom.
 	DelegatedRoutingEndpoint string
 
+	// DNSServers are the resolvers used to look up addresses, for example
+	// "1.1.1.1" or "2606:4700:4700::1111". A port may be given, and is 53 without
+	// one.
+	//
+	// Only /dnsaddr/ bootstrap addresses need this, and only on platforms that
+	// publish no resolver configuration of their own - Android among them, where
+	// they are otherwise unresolvable. Empty uses whatever the platform offers.
+	DNSServers []string
+
 	// Gateways are HTTP gateway URLs, for example "https://ipfs.io", fetched from
 	// alongside libp2p peers. What they return is verified like any other block.
 	Gateways []string
@@ -90,12 +99,11 @@ type Client struct {
 // New validates the configuration and returns a Client. The node itself is not
 // started until the first download.
 func New(config *Config) (*Client, error) {
-	peers, err := parsePeers(config.BootstrapPeers)
-	if err != nil {
-		return nil, err
-	}
+	peers := parsePeers(config.BootstrapPeers)
 
-	gateways, gatewayHosts, err := parseGateways(config.Gateways)
+	gateways, gatewayHosts := parseGateways(config.Gateways)
+
+	resolver, err := newResolver(config.DNSServers)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +114,7 @@ func New(config *Config) (*Client, error) {
 		disableDHT:   config.DisableDHT,
 		gateways:     gateways,
 		gatewayHosts: gatewayHosts,
+		resolver:     resolver,
 	}
 
 	if config.DelegatedRoutingEndpoint != "" {
@@ -118,8 +127,17 @@ func New(config *Config) (*Client, error) {
 	}
 
 	// Peers, gateways and an indexer are each enough on their own, so the
-	// requirement is only that at least one of them is configured.
+	// requirement is only that one of them survived parsing. Invalid entries are
+	// skipped rather than fatal, since a typo in one list should not take away a
+	// route that another list still provides.
 	if len(peers) == 0 && len(gateways) == 0 && node.delegated == nil {
+		if configured := len(config.BootstrapPeers) + len(config.Gateways); configured > 0 {
+			return nil, fmt.Errorf(
+				"none of the %d configured bootstrap peers and gateways is a valid address, there is nowhere to fetch from",
+				configured,
+			)
+		}
+
 		return nil, errors.New("no bootstrap peers, gateways or delegated routing endpoint configured, there is nowhere to fetch from")
 	}
 
@@ -187,6 +205,13 @@ func (client *Client) Get(ctx context.Context, cidStr string, output string, siz
 		return err
 	}
 
+	// Close may have landed while the primary phase was running. The fallback
+	// holds no node, so nothing else would stop a retired client from reaching
+	// the network and writing output.
+	if client.isClosed() {
+		return ErrClosed
+	}
+
 	fmt.Printf("primary retrieval of %s failed (%s), trying gateways unverified\n", parsed, err)
 
 	fallbackErr := client.fetchFromGateways(ctx, parsed, output, sizeLimit)
@@ -206,6 +231,13 @@ func (client *Client) Get(ctx context.Context, cidStr string, output string, siz
 // primaryShare caps how much of the caller's remaining time the primary phase
 // may spend, so a hanging route still leaves budget to fall back with.
 const primaryShare = 0.75
+
+func (client *Client) isClosed() bool {
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+
+	return client.closed
+}
 
 func (client *Client) fallbackAvailable() bool {
 	return client.allowUnverified && len(client.gateways) > 0

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"ipfs-mobile/internal/testpeer"
 	"os"
@@ -74,13 +75,10 @@ func TestNodeCloseStopsTheWholeExchange(t *testing.T) {
 func TestParsePeersMergesAddressesForOneID(t *testing.T) {
 	const id = "12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"
 
-	peers, err := parsePeers([]string{
+	peers := parsePeers([]string{
 		"/ip4/127.0.0.1/tcp/1/p2p/" + id,
 		"/ip4/127.0.0.2/tcp/2/p2p/" + id,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	if len(peers) != 1 {
 		t.Fatalf("got %d peers, want 1", len(peers))
@@ -90,13 +88,10 @@ func TestParsePeersMergesAddressesForOneID(t *testing.T) {
 	}
 }
 
-func TestConnectToPeersFailsWhenNoneAnswer(t *testing.T) {
-	peers, err := parsePeers([]string{deadPeer})
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestDialAllSettlesWithNothingConnectedWhenNoneAnswer(t *testing.T) {
+	peers := parsePeers([]string{deadPeer})
 
-	host, err := makeHost(0)
+	host, err := makeHost(0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,24 +100,28 @@ func TestConnectToPeersFailsWhenNoneAnswer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err = connectToPeers(ctx, ctx, host, peers)
-	if err == nil {
-		t.Fatal("expected an error when no peer answers, got nil")
+	group := dialAll(ctx, peers, host.Connect, peerName)
+
+	select {
+	case <-group.done:
+	case <-ctx.Done():
+		t.Fatal("the dial never settled")
 	}
-	if !strings.Contains(err.Error(), "failed to connect to any") {
-		t.Errorf("err = %v, want it to report that no peer answered", err)
+
+	if group.count() != 0 {
+		t.Errorf("connected to %d peers, want 0", group.count())
+	}
+	if !group.finished() {
+		t.Error("finished() is false once every dial has settled")
 	}
 }
 
-func TestConnectToPeersReturnsOnFirstReachable(t *testing.T) {
+func TestDialAllSignalsTheFirstReachablePeer(t *testing.T) {
 	addr, _ := testpeer.Serve(t, testpeer.Content(64))
 
-	peers, err := parsePeers([]string{deadPeer, addr})
-	if err != nil {
-		t.Fatal(err)
-	}
+	peers := parsePeers([]string{deadPeer, addr})
 
-	host, err := makeHost(0)
+	host, err := makeHost(0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,8 +130,75 @@ func TestConnectToPeersReturnsOnFirstReachable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := connectToPeers(ctx, ctx, host, peers); err != nil {
-		t.Errorf("a reachable peer was present but connect failed: %v", err)
+	group := dialAll(ctx, peers, host.Connect, peerName)
+
+	select {
+	case <-group.first:
+	case <-ctx.Done():
+		t.Fatal("a reachable peer was present but nothing reported connecting")
+	}
+}
+
+// A peer that accepts the connection and then says nothing holds its dial open
+// until libp2p gives up on it. The budget here is shorter than that, so a
+// download that waits for the dial cannot finish at all - while one that asks
+// the gateway already connected to it has time to spare.
+func TestStalledPeerDoesNotHoldUpAConnectedGateway(t *testing.T) {
+	content := testpeer.Content(4096)
+	gateway, root, _ := testpeer.ServeTrustlessGateway(t, content)
+
+	client := newClient(t, &Config{
+		BootstrapPeers: []string{testpeer.Stalled(t)},
+		Gateways:       []string{gateway},
+		// Only the verified path may satisfy this.
+		AllowUnverifiedGatewayFallback: false,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), stalledPeerGivesUpAfter-time.Second)
+	defer cancel()
+
+	output := filepath.Join(t.TempDir(), "out")
+	if err := client.Get(ctx, root, output, -1); err != nil {
+		t.Fatalf("a connected gateway held the content but the fetch failed: %v", err)
+	}
+
+	written, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(written, content) {
+		t.Error("the content written does not match what the gateway served")
+	}
+}
+
+// How long libp2p spends on a peer that accepts the connection and then goes
+// quiet. Asserted rather than assumed, since the test above is only meaningful
+// while the budget it sets is the shorter of the two.
+const stalledPeerGivesUpAfter = 5 * time.Second
+
+func TestStalledPeerGivesUpWhenExpected(t *testing.T) {
+	peers := parsePeers([]string{testpeer.Stalled(t)})
+
+	host, err := makeHost(0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	group := dialAll(ctx, peers, host.Connect, peerName)
+
+	select {
+	case <-group.done:
+	case <-ctx.Done():
+		t.Fatal("the stalled dial never settled")
+	}
+
+	if elapsed := time.Since(started); elapsed < stalledPeerGivesUpAfter {
+		t.Errorf("a stalled dial settled after %s, sooner than the assumed %s", elapsed, stalledPeerGivesUpAfter)
 	}
 }
 
@@ -212,5 +278,140 @@ func TestConfiguredGatewaysFormTheHTTPAllowlist(t *testing.T) {
 
 	if client.node.http == nil {
 		t.Error("no HTTP exchange despite configured gateways")
+	}
+}
+
+// A lookup meets far more peers than the configuration names, and the peer that
+// holds the content must not be the one evicted to make room for them.
+func TestConfiguredPeersAreProtectedFromTrimming(t *testing.T) {
+	addr, _ := testpeer.Serve(t, testpeer.Content(64))
+
+	peers := parsePeers([]string{addr, deadPeer})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	node, err := startNode(ctx, nodeConfig{peers: peers, disableDHT: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.close()
+
+	for _, peerInfo := range peers {
+		if !node.host.ConnManager().IsProtected(peerInfo.ID, configuredPeerTag) {
+			t.Errorf("configured peer %s is not protected from trimming", peerInfo.ID)
+		}
+	}
+
+	// A peer nobody configured has no such claim.
+	otherAddr, _ := testpeer.Serve(t, testpeer.Content(32))
+
+	stranger := parsePeers([]string{otherAddr})
+	if node.host.ConnManager().IsProtected(stranger[0].ID, configuredPeerTag) {
+		t.Error("a peer that was never configured is protected")
+	}
+}
+
+// go-libp2p's own watermarks are a server's. Asserted because the cost of
+// inheriting them is paid on a phone, where nothing here would notice.
+func TestConnectionWatermarksAreNotTheLibp2pDefaults(t *testing.T) {
+	const libp2pLow, libp2pHigh = 160, 192
+
+	if highWaterConnections >= libp2pHigh || lowWaterConnections >= libp2pLow {
+		t.Errorf(
+			"watermarks %d/%d are not below go-libp2p's %d/%d",
+			lowWaterConnections, highWaterConnections, libp2pLow, libp2pHigh,
+		)
+	}
+	if lowWaterConnections >= highWaterConnections {
+		t.Errorf("low water %d is not below high water %d", lowWaterConnections, highWaterConnections)
+	}
+	if connectionGracePeriod >= time.Minute {
+		t.Errorf("grace period %s does not shorten go-libp2p's minute", connectionGracePeriod)
+	}
+}
+
+// A download's own staging directory is never swept, however old it looks. A
+// directory's modified time does not advance while a file inside it is written,
+// so age alone cannot tell a slow download from an abandoned one.
+func TestSweepLeavesADownloadInProgressAlone(t *testing.T) {
+	dir := t.TempDir()
+
+	live, release, err := claimScratch(dir, scratchPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	abandoned, err := os.MkdirTemp(dir, scratchPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Both look equally stale from the outside, which is the whole point.
+	old := time.Now().Add(-2 * scratchStaleAfter)
+	for _, path := range []string{live, abandoned} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sweepScratchPrefix(dir, scratchPrefix)
+
+	if _, err := os.Stat(live); os.IsNotExist(err) {
+		t.Error("the sweep deleted a staging directory still being written to")
+	}
+	if _, err := os.Stat(abandoned); !os.IsNotExist(err) {
+		t.Error("a staging directory from a dead process survived the sweep")
+	}
+}
+
+// Releasing removes the directory and gives up the claim, so a later sweep is
+// free to act on anything left behind.
+func TestReleasingAScratchClaimRemovesIt(t *testing.T) {
+	dir := t.TempDir()
+
+	scratch, release, err := claimScratch(dir, scratchPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	release()
+
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Error("the staging directory survived its release")
+	}
+	if _, live := staging.Load(scratch); live {
+		t.Error("the claim outlived the directory")
+	}
+}
+
+// Noise is offered ahead of TLS, so a peer supporting both agrees on the first
+// proposal rather than after rejecting one. The saved round trip is what keeps
+// peers with short handshake deadlines reachable.
+func TestNoiseIsProposedBeforeTLS(t *testing.T) {
+	addr, root := testpeer.Serve(t, testpeer.Content(64))
+
+	client := newClient(t, &Config{BootstrapPeers: []string{addr}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := client.Get(ctx, root, filepath.Join(t.TempDir(), "out"), -1); err != nil {
+		t.Fatal(err)
+	}
+
+	client.mutex.Lock()
+	defer client.mutex.Unlock()
+
+	conns := client.node.host.Network().Conns()
+	if len(conns) == 0 {
+		t.Fatal("no connection to inspect")
+	}
+
+	for _, conn := range conns {
+		if security := conn.ConnState().Security; security != "/noise" {
+			t.Errorf("negotiated %s, want /noise to have been proposed first", security)
+		}
 	}
 }

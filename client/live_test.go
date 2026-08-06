@@ -240,12 +240,12 @@ func TestLiveIdleShutdownAndRestart(t *testing.T) {
 // A failure here is a problem with the peer list, not with this package, so each
 // peer is logged individually.
 func TestLiveBootstrapPeersAreReachable(t *testing.T) {
-	peers, err := parsePeers(livePeers())
-	if err != nil {
-		t.Fatalf("parsing the configured peer list: %v", err)
+	peers := parsePeers(livePeers())
+	if len(peers) == 0 {
+		t.Fatalf("none of the %d configured peers parsed", len(livePeers()))
 	}
 
-	host, err := makeHost(0)
+	host, err := makeHost(0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,5 +404,119 @@ func TestLiveAllRoutesTogether(t *testing.T) {
 			total, _ := treeDigest(t, output)
 			t.Logf("%s: %d bytes in %v", target.name, total, time.Since(start).Truncate(time.Millisecond))
 		})
+	}
+}
+
+// A DHT lookup meets far more peers than the configuration names, and the
+// connection table is finite. Without the configured peers being protected from
+// trimming, the bootstrap burst evicts the very peers that hold the content -
+// which is fatal where gateways are blocked and they are the only route.
+//
+// Reproduces as roughly one run in four on a desktop, and every run on a phone,
+// so it is asserted over several rounds rather than one.
+func TestLiveConfiguredPeersSurviveTheDHTBootstrap(t *testing.T) {
+	peers := parsePeers(livePeers())
+	if len(peers) == 0 {
+		t.Skip("no bootstrap peers configured")
+	}
+
+	const rounds = 3
+
+	for round := range rounds {
+		ctx, cancel := context.WithTimeout(context.Background(), liveTimeout)
+
+		node, err := startNode(ctx, nodeConfig{peers: peers})
+		if err != nil {
+			cancel()
+			t.Fatalf("round %d: %v", round, err)
+		}
+
+		// Long enough for the DHT to have filled the connection table.
+		time.Sleep(20 * time.Second)
+
+		connected := make(map[string]bool)
+		for _, id := range node.host.Network().Peers() {
+			connected[id.String()] = true
+		}
+
+		total := len(connected)
+		kept := 0
+
+		for _, peerInfo := range peers {
+			if !node.host.ConnManager().IsProtected(peerInfo.ID, configuredPeerTag) {
+				t.Errorf("round %d: %s lost its protection", round, peerInfo.ID)
+			}
+			if connected[peerInfo.ID.String()] {
+				kept++
+			}
+		}
+
+		// Logged, not asserted: the connection manager trims on a tick once the
+		// grace period is up, so the count during a bootstrap burst says nothing
+		// about the watermarks.
+		t.Logf("round %d: %d of %d configured peers connected, %d peers in total",
+			round, kept, len(peers), total)
+
+		if kept == 0 {
+			t.Errorf("round %d: no configured peer survived the bootstrap", round)
+		}
+
+		node.close()
+		cancel()
+	}
+}
+
+// A download starting while the connection table is over the high water mark,
+// which is when the connection manager is actively culling. Trimming settings
+// that look harmless against a node at rest can cut the connections a fetch in
+// flight is using, and the caller sees only a timeout.
+//
+// Measuring connection counts is not enough to catch that: a fetch issued before
+// the bootstrap burst finds nothing to trim and always passes.
+func TestLiveDownloadSurvivesConnectionTrimming(t *testing.T) {
+	peers := parsePeers(livePeers())
+	if len(peers) == 0 {
+		t.Skip("no bootstrap peers configured")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	node, err := startNode(ctx, nodeConfig{peers: peers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer node.close()
+
+	// Wait for the burst to put the table above the mark, so trimming is running.
+	deadline := time.Now().Add(60 * time.Second)
+	peak := 0
+	for time.Now().Before(deadline) {
+		if count := len(node.host.Network().Peers()); count > peak {
+			peak = count
+		}
+		if peak > highWaterConnections {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if peak <= highWaterConnections {
+		t.Skipf("connections peaked at %d, never above the %d mark; nothing to trim", peak, highWaterConnections)
+	}
+
+	target := mustParseCID(t, liveCID())
+
+	fetch, stop := context.WithTimeout(ctx, liveTimeout)
+	defer stop()
+
+	start := time.Now()
+	err = node.download(fetch, target, filepath.Join(t.TempDir(), "out"), -1)
+	elapsed := time.Since(start)
+
+	t.Logf("fetched during trimming (peak %d connections) in %s", peak, elapsed.Round(time.Millisecond))
+
+	if err != nil {
+		t.Fatalf("download failed while the connection manager was trimming: %v", err)
 	}
 }

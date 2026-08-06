@@ -17,8 +17,12 @@ import (
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
+	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/routing"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	"github.com/libp2p/go-libp2p/p2p/security/noise"
+	libp2ptls "github.com/libp2p/go-libp2p/p2p/security/tls"
 
 	"github.com/multiformats/go-multiaddr"
 
@@ -37,6 +41,37 @@ const (
 	// Upper bound on waiting for a usable DHT routing table.
 	dhtReadyTimeout = 5 * time.Second
 	dhtReadyPoll    = 50 * time.Millisecond
+
+	// How long startup waits for the first peer or gateway to answer. Dialling
+	// carries on past it; only the waiting stops.
+	startupTimeout = 2 * time.Second
+
+	// Connection watermarks: above the high one, connections are trimmed back to
+	// the low one. go-libp2p defaults to 160/192, which suits a server. A DHT
+	// lookup opens as many connections as it is allowed to, and on a phone each
+	// one costs battery and a slot in the carrier's NAT table.
+	lowWaterConnections  = 16
+	highWaterConnections = 32
+
+	// New connections are exempt from trimming for this long. The default minute
+	// leaves a lookup's connections all held through the burst that opened them.
+	connectionGracePeriod = 20 * time.Second
+
+	// Marks the peers named in the configuration, which are the ones that hold the
+	// content, so a lookup filling the connection table cannot displace them.
+	configuredPeerTag = "configured"
+
+	// How many peers a lookup queries at once, and how many it checks for
+	// admission to the routing table at once. The defaults, 10 and 256, suit a
+	// machine that can afford the connections: bootstrapping under them peaks
+	// around 76 and spikes past 100, against 40 and a ceiling of 47 here.
+	//
+	// Measured, not guessed - the two are not interchangeable. Lowering the
+	// admission check alone left the median where it was; the query width is what
+	// the burst follows. Narrower means a lookup walks the network in more rounds,
+	// which is the trade: slightly slower lookups for a burst a phone survives.
+	dhtQueryConcurrency = 3
+	dhtAdmissionChecks  = 16
 )
 
 // node is a running libp2p host with a block exchange and a DHT, owned by
@@ -64,13 +99,16 @@ type nodeConfig struct {
 	gatewayHosts []string
 
 	delegated routing.ContentDiscovery
+
+	// resolver is what libp2p resolves addresses with. Nil leaves it its own.
+	resolver libp2pnet.MultiaddrDNSResolver
 }
 
-// startNode brings up a host and blocks until it has somewhere to fetch from,
-// bounded by ctx. Failing here beats letting the download hang on a node with no
-// connections.
+// startNode brings up a host and gives its dials a short head start, bounded by
+// ctx. It fails only when there is provably nowhere to fetch from, which beats
+// letting the download wait out the deadline to learn the same thing.
 func startNode(ctx context.Context, config nodeConfig) (*node, error) {
-	host, err := makeHost(config.port)
+	host, err := makeHost(config.port, config.resolver)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +123,13 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	if !config.disableDHT {
 		// Client mode: a phone behind NAT on a metered connection makes a poor DHT
 		// server, so query without answering.
-		kad, err := dht.New(host, dht.Mode(dht.ModeClient), dht.BootstrapPeers(config.peers...))
+		kad, err := dht.New(
+			host,
+			dht.Mode(dht.ModeClient),
+			dht.BootstrapPeers(config.peers...),
+			dht.Concurrency(dhtQueryConcurrency),
+			dht.LookupCheckConcurrency(dhtAdmissionChecks),
+		)
 		if err != nil {
 			node.close()
 			return nil, fmt.Errorf("starting the dht: %w", err)
@@ -124,34 +168,83 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	)
 	node.exchange.Start(node.bs)
 
+	// A DHT lookup meets far more peers than the configuration names, and without
+	// this the connection manager would treat them all alike - trimming the peer
+	// holding the content in favour of one that happened to answer a lookup. Where
+	// gateways are blocked, that peer is the only way to the content at all.
+	for _, peerInfo := range config.peers {
+		host.ConnManager().Protect(peerInfo.ID, configuredPeerTag)
+	}
+
 	// Dialled on the node's own context, not the caller's: these outlive the
 	// download that happened to start the node, and cancelling them with it would
 	// leave a reused node stuck on whichever peer answered first.
-	gateways := connectToGateways(ctx, nodeCtx, node.http, config.gateways)
+	gateways := dialAll(nodeCtx, config.gateways, func(ctx context.Context, gateway peer.AddrInfo) error {
+		return node.http.Connect(ctx, gateway)
+	}, gatewayName)
+
+	peers := dialAll(nodeCtx, config.peers, host.Connect, peerName)
+
+	// Bitswap asks whoever is connected and asks again as others arrive, so
+	// startup only needs somewhere to send the first request. Waiting for the
+	// remaining dials would spend the download's time on connections it can pick
+	// up while it runs.
+	awaitConnection(ctx, gateways, peers)
 
 	// Peers, gateways and an indexer are each enough on their own.
-	reachable := gateways > 0 || config.delegated != nil
-
-	if err := connectToPeers(ctx, nodeCtx, host, config.peers); err != nil {
-		if !reachable {
+	if gateways.count() == 0 && peers.count() == 0 && config.delegated == nil {
+		// A dial still in flight can land mid-download, so only a node with
+		// nothing left to try has provably nowhere to go.
+		if gateways.finished() && peers.finished() {
 			node.close()
-			return nil, err
+
+			if ctx.Err() != nil {
+				return nil, contextError(ctx)
+			}
+
+			return nil, fmt.Errorf(
+				"none of the %d bootstrap peers and %d gateways could be reached",
+				len(config.peers), len(config.gateways),
+			)
 		}
 
-		fmt.Printf("continuing without libp2p peers: %s\n", err)
+		fmt.Println("no peer or gateway answered yet, starting the download anyway")
 	}
 
 	if node.dht != nil {
-		node.bootstrapDHT(ctx)
+		// On the node's context: the table fills from the same dials, and a
+		// download that has peers to ask does not need to wait for it.
+		go node.bootstrapDHT(nodeCtx)
 	}
 
 	return node, nil
 }
 
-// bootstrapDHT waits briefly for the routing table to hold a peer, since a
-// lookup against an empty one finds nothing and spends the caller's deadline
-// doing it. Never fatal: connected peers may hold the content anyway, and the
-// table keeps filling during the download.
+// awaitConnection waits for one peer or gateway to answer, giving up once every
+// dial has settled, startupTimeout passes, or the caller's deadline arrives -
+// whichever comes first.
+func awaitConnection(ctx context.Context, gateways, peers *dialGroup) {
+	wait, stop := context.WithTimeout(ctx, startupTimeout)
+	defer stop()
+
+	exhausted := make(chan struct{})
+	go func() {
+		<-gateways.done
+		<-peers.done
+		close(exhausted)
+	}()
+
+	select {
+	case <-gateways.first:
+	case <-peers.first:
+	case <-exhausted:
+	case <-wait.Done():
+	}
+}
+
+// bootstrapDHT fills the routing table, which a lookup needs to find anything.
+// Never fatal: connected peers may hold the content anyway, and the table keeps
+// filling during the download.
 func (node *node) bootstrapDHT(ctx context.Context) {
 	if err := node.dht.Bootstrap(ctx); err != nil {
 		fmt.Printf("failed to bootstrap the dht: %s\n", err)
@@ -207,11 +300,11 @@ func (node *node) download(ctx context.Context, target cid.Cid, output string, s
 	// output is replaced if it already exists.
 	sweepScratch(filepath.Dir(output))
 
-	scratch, err := os.MkdirTemp(filepath.Dir(output), scratchPrefix)
+	scratch, release, err := claimScratch(filepath.Dir(output), scratchPrefix)
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(scratch)
+	defer release()
 
 	staged := filepath.Join(scratch, "data")
 	if _, err := materialise(unixfsnd, staged, sizeLimit, 0); err != nil {
@@ -230,6 +323,28 @@ const scratchPrefix = ".ipfs-download-"
 // How old a staging directory must be before it is treated as the remains of a
 // process that died rather than a download still running.
 const scratchStaleAfter = time.Hour
+
+// Staging directories this process is currently writing into. A download's own
+// directory is never a candidate for sweeping, however long it takes: age alone
+// cannot tell a slow download from an abandoned one, since writing a file does
+// not advance the modified time of the directory holding it.
+var staging sync.Map
+
+// claimScratch creates a staging directory under dir and returns it with the
+// function that releases and removes it.
+func claimScratch(dir string, prefix string) (string, func(), error) {
+	scratch, err := os.MkdirTemp(dir, prefix)
+	if err != nil {
+		return "", nil, err
+	}
+
+	staging.Store(scratch, struct{}{})
+
+	return scratch, func() {
+		staging.Delete(scratch)
+		os.RemoveAll(scratch)
+	}, nil
+}
 
 // sweepScratch removes staging directories left behind by a previous run. The
 // deferred cleanup only covers a live process, and on mobile the app is killed
@@ -250,18 +365,25 @@ func sweepScratchPrefix(dir string, prefix string) {
 			continue
 		}
 
+		path := filepath.Join(dir, entry.Name())
+
+		// A download running right now, however long it has been going.
+		if _, live := staging.Load(path); live {
+			continue
+		}
+
 		info, err := entry.Info()
 		if err != nil {
 			continue
 		}
 
-		// Age matters: concurrent downloads stage alongside each other, so
-		// removing every match would delete a sibling's work in progress.
+		// Everything else belongs to some other process, which may still be alive
+		// and writing. Age is the only signal available about one of those.
 		if time.Since(info.ModTime()) < scratchStaleAfter {
 			continue
 		}
 
-		os.RemoveAll(filepath.Join(dir, entry.Name()))
+		os.RemoveAll(path)
 	}
 }
 
@@ -288,7 +410,7 @@ func materialise(nd files.Node, path string, sizeLimit int64, written int64) (in
 
 		count, err := writeLimited(path, node, remaining)
 
-		return written + count, err
+		return written + count, sizeLimitWithTotals(err, written+count, sizeLimit)
 
 	case files.Directory:
 		if err := os.Mkdir(path, 0o755); err != nil {
@@ -344,7 +466,7 @@ func (node *node) close() {
 	node.host.Close()
 }
 
-func makeHost(port int32) (host.Host, error) {
+func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, error) {
 	// Ed25519 because the identity is ephemeral and RSA keygen costs seconds on
 	// mobile ARM cores.
 	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
@@ -352,9 +474,32 @@ func makeHost(port int32) (host.Host, error) {
 		return nil, err
 	}
 
+	connections, err := connmgr.NewConnManager(
+		lowWaterConnections,
+		highWaterConnections,
+		connmgr.WithGracePeriod(connectionGracePeriod),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("building the connection manager: %w", err)
+	}
+
 	opts := []libp2p.Option{
 		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", port)),
 		libp2p.Identity(priv),
+		libp2p.ConnectionManager(connections),
+
+		// Noise before TLS, reversing go-libp2p's own order. Every libp2p
+		// implementation has to support Noise, fewer support TLS, and a proposal
+		// the peer rejects costs a round trip before the handshake even starts.
+		//
+		// That round trip is the difference between reaching a peer with a tight
+		// handshake deadline and not.
+		libp2p.Security(noise.ID, noise.New),
+		libp2p.Security(libp2ptls.ID, libp2ptls.New),
+	}
+
+	if resolver != nil {
+		opts = append(opts, libp2p.MultiaddrResolver(resolver))
 	}
 
 	return libp2p.New(opts...)
@@ -363,7 +508,7 @@ func makeHost(port int32) (host.Host, error) {
 // parsePeers validates bootstrap addresses when the Client is built rather than
 // at the first download. Invalid entries are skipped, and an empty result is not
 // an error: gateways or an indexer may be the only configured route.
-func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
+func parsePeers(addrs []string) []peer.AddrInfo {
 	infos := make(map[peer.ID]*peer.AddrInfo, len(addrs))
 	order := make([]peer.ID, 0, len(addrs))
 
@@ -390,111 +535,94 @@ func parsePeers(addrs []string) ([]peer.AddrInfo, error) {
 		info.Addrs = append(info.Addrs, parsed.Addrs...)
 	}
 
-	if len(infos) == 0 && len(addrs) > 0 {
-		return nil, fmt.Errorf("none of the %d configured bootstrap peers is a valid address", len(addrs))
-	}
-
 	// Configured order rather than the map's, so behaviour is stable.
 	peers := make([]peer.AddrInfo, 0, len(order))
 	for _, id := range order {
 		peers = append(peers, *infos[id])
 	}
 
-	return peers, nil
+	return peers
 }
 
-// connectToGateways registers each gateway and reports how many answered.
-// Connecting means the endpoint responded to a probe, not that a libp2p
-// handshake completed. Unreachable gateways are logged, never fatal.
-func connectToGateways(ctx context.Context, nodeCtx context.Context, exchange network.BitSwapNetwork, gateways []peer.AddrInfo) int {
-	if len(gateways) == 0 {
-		return 0
+// dialGroup is a set of dials running in the background.
+type dialGroup struct {
+	// first closes when one target has answered, done when all have settled.
+	first chan struct{}
+	done  chan struct{}
+
+	connected atomic.Int32
+}
+
+func (group *dialGroup) count() int {
+	return int(group.connected.Load())
+}
+
+// finished reports whether every dial has settled, successfully or not.
+func (group *dialGroup) finished() bool {
+	select {
+	case <-group.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// dialAll starts every dial at once and returns without waiting for any of them.
+// Dials still running when the caller moves on keep running, so a target that
+// answers late still joins the exchange and can serve blocks mid-download.
+func dialAll(
+	ctx context.Context,
+	targets []peer.AddrInfo,
+	connect func(context.Context, peer.AddrInfo) error,
+	name func(peer.AddrInfo) string,
+) *dialGroup {
+	group := &dialGroup{first: make(chan struct{}), done: make(chan struct{})}
+
+	if len(targets) == 0 {
+		close(group.done)
+		return group
 	}
 
 	var (
-		wait      sync.WaitGroup
-		connected atomic.Int32
+		wait sync.WaitGroup
+		once sync.Once
 	)
 
-	wait.Add(len(gateways))
+	wait.Add(len(targets))
 
-	for _, gateway := range gateways {
-		go func(gateway peer.AddrInfo) {
+	for _, target := range targets {
+		go func() {
 			defer wait.Done()
 
-			if err := exchange.Connect(nodeCtx, gateway); err != nil {
-				fmt.Printf("gateway %s unreachable: %s\n", gatewayName(gateway), err)
+			if err := connect(ctx, target); err != nil {
+				fmt.Printf("failed to connect to %s: %s\n", name(target), err)
 				return
 			}
 
-			connected.Add(1)
-		}(gateway)
+			group.connected.Add(1)
+			once.Do(func() { close(group.first) })
+		}()
 	}
 
-	wait.Wait()
+	go func() {
+		wait.Wait()
+		close(group.done)
+	}()
 
-	return int(connected.Load())
+	return group
 }
 
 // gatewayName renders a gateway for logs, where its synthetic peer ID would be
-// noise.
+// noise. Connecting to one means it responded to a probe, not that a libp2p
+// handshake completed.
 func gatewayName(gateway peer.AddrInfo) string {
 	if len(gateway.Addrs) == 0 {
-		return gateway.ID.String()
+		return "gateway " + gateway.ID.String()
 	}
 
-	return gateway.Addrs[0].String()
+	return "gateway " + gateway.Addrs[0].String()
 }
 
-// connectToPeers dials every peer in parallel and returns once one answers,
-// bounded by ctx. The rest keep dialling on nodeCtx rather than holding up the
-// caller, and so survive the download that started them.
-func connectToPeers(ctx context.Context, nodeCtx context.Context, host host.Host, peers []peer.AddrInfo) error {
-	if len(peers) == 0 {
-		return fmt.Errorf("no bootstrap peers configured")
-	}
-
-	var (
-		wg        sync.WaitGroup
-		once      sync.Once
-		connected atomic.Int32
-	)
-
-	first := make(chan struct{})
-	wg.Add(len(peers))
-
-	for _, peerInfo := range peers {
-		go func(peerInfo peer.AddrInfo) {
-			defer wg.Done()
-
-			if err := host.Connect(nodeCtx, peerInfo); err != nil {
-				fmt.Printf("failed to connect to %s: %s\n", peerInfo.ID, err)
-				return
-			}
-
-			connected.Add(1)
-			once.Do(func() { close(first) })
-		}(peerInfo)
-	}
-
-	exhausted := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(exhausted)
-	}()
-
-	select {
-	case <-first:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-exhausted:
-		// Every dial finished. A success racing the last failure would leave both
-		// channels ready, so re-check rather than trusting the select.
-		if connected.Load() > 0 {
-			return nil
-		}
-
-		return fmt.Errorf("failed to connect to any of the %d bootstrap peers", len(peers))
-	}
+func peerName(info peer.AddrInfo) string {
+	return "peer " + info.ID.String()
 }
