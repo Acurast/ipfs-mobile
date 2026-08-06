@@ -1,0 +1,42 @@
+# Version control
+.git
+
+# Build outputs, all regenerated inside the container. The .aar especially: it is
+# gitignored, so a local copy would otherwise be baked in and Gradle could
+# assemble against a stale bind.
+**/build
+**/.gradle
+**/.kotlin
+**/.cxx
+**/.externalNativeBuild
+android/ffi/*.aar
+android/ffi/*.jar
+*.aar
+*.apk
+IPFS.xcframework
+
+# Local configuration and anything resembling a secret
+**/local.properties
+**/keystore.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pem
+**/*.key
+**/.env
+
+# Go test and coverage leftovers
+*.test
+*.out
+coverage.*
+*-report.xml
+
+# IDE, agent and OS files
+**/.idea
+**/*.iml
+.vscode
+.claude
+**/.DS_Store
+
+# Logs
+**/*.log

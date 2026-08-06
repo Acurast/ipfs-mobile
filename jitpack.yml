@@ -3,7 +3,7 @@ before_install:
   - sdkmanager "ndk;29.0.14206865"
   - sdk install java 17.0.9-tem
   - sdk use java 17.0.9-tem
-  - wget -q https://go.dev/dl/go1.25.7.linux-amd64.tar.gz -O go.linux-amd64.tar.gz && tar -C ~/ -xzf go.linux-amd64.tar.gz
+  - wget -q https://go.dev/dl/go1.25.12.linux-amd64.tar.gz -O go.linux-amd64.tar.gz && tar -C ~/ -xzf go.linux-amd64.tar.gz
   - export PATH=$PATH:~/go/bin
   - export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865
   - go install golang.org/x/mobile/cmd/gomobile@latest
