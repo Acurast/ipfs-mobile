@@ -13,18 +13,34 @@ import ffi.Client as FfiClient
 import ffi.ClientConfig
 
 /**
+ * An [Ipfs] that can resolve the `/dnsaddr/` addresses among its bootstrap peers,
+ * by naming the resolvers the active network is using.
+ *
+ * They are read once, here, so a client outliving the network it was built on
+ * keeps that network's resolvers.
+ */
+public fun Ipfs(
+    context: Context,
+    routing: Ipfs.Routing = Ipfs.Routing(),
+    gateways: Ipfs.Gateways = Ipfs.Gateways(),
+    timeouts: Ipfs.Timeouts = Ipfs.Timeouts(),
+    port: Int = Ipfs.PORT,
+): Ipfs = Ipfs(routing.withDnsServers(context.dnsServers), gateways, timeouts, port)
+
+/** Bootstrap peers alone. */
+public fun Ipfs(context: Context, bootstrapNodes: List<String>): Ipfs =
+    Ipfs(context, routing = Ipfs.Routing(bootstrapNodes))
+
+/**
  * A reusable IPFS client, safe to share between coroutines. The node is started
  * on the first download and reused by later ones, and [close] releases it.
  */
-public class Ipfs(
+public class Ipfs internal constructor(
     private val routing: Routing = Routing(),
     private val gateways: Gateways = Gateways(),
     private val timeouts: Timeouts = Timeouts(),
     private val port: Int = PORT,
 ) : Closeable {
-
-    /** Bootstrap peers alone, which is the common case. */
-    public constructor(bootstrapNodes: List<String>) : this(routing = Routing(bootstrapNodes))
 
     /** How content is located. */
     public data class Routing(
@@ -213,26 +229,6 @@ public class Ipfs(
         private const val DELIMITER_LIST_STRING = ";"
     }
 }
-
-/**
- * An [Ipfs] that can resolve the `/dnsaddr/` addresses among its bootstrap peers,
- * by naming the resolvers the active network is using. Prefer this over the
- * constructor on Android, where nothing else supplies them.
- *
- * They are read once, here, so a client outliving the network it was built on
- * keeps that network's resolvers.
- */
-public fun Ipfs(
-    context: Context,
-    routing: Ipfs.Routing = Ipfs.Routing(),
-    gateways: Ipfs.Gateways = Ipfs.Gateways(),
-    timeouts: Ipfs.Timeouts = Ipfs.Timeouts(),
-    port: Int = Ipfs.PORT,
-): Ipfs = Ipfs(routing.withDnsServers(context.dnsServers), gateways, timeouts, port)
-
-/** Bootstrap peers alone, which is the common case. */
-public fun Ipfs(context: Context, bootstrapNodes: List<String>): Ipfs =
-    Ipfs(context, routing = Ipfs.Routing(bootstrapNodes))
 
 // Configured resolvers first, so a caller that named one is not left behind
 // whatever the network reports.

@@ -12,12 +12,6 @@ import kotlin.time.Duration.Companion.seconds
  */
 class IpfsConfigTest {
 
-    /** The shape existing callers use, kept working by the secondary constructor. */
-    @Test
-    fun bootstrapNodesOnly() {
-        Ipfs(bootstrapNodes = listOf("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWDpJ7As7BWAwRMfu1VU2WCqNjvq387JEYKDBj4kx6nXTN"))
-    }
-
     @Test
     fun groupedConfiguration() {
         Ipfs(
