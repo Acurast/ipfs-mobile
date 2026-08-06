@@ -1,0 +1,186 @@
+image: docker:latest
+
+variables:
+  GOOGLE_TAG: eu.gcr.io/papers-kubernetes/$CI_PROJECT_NAMESPACE/$CI_PROJECT_NAME:$CI_COMMIT_SHA
+
+stages:
+  - prepare
+  - test
+  - build
+
+prepare:
+  stage: prepare
+  script:
+    - docker build -t $GOOGLE_TAG .
+  tags:
+    - docker
+
+### Test ###
+
+# Each job runs in a fresh container off the prepared image.
+#
+# bash, not sh: the image is Debian, where /bin/sh is dash and `set -o pipefail`
+# is unavailable. Without it a failing `go test` would be masked by the exit
+# status of the report generator at the end of the pipe.
+.test:base:
+  stage: test
+  interruptible: true
+  after_script:
+    - docker rm -f $CONTAINER_TAG || true
+  tags:
+    - docker
+
+lint:
+  extends: .test:base
+  variables:
+    CONTAINER_TAG: go-lint-$CI_COMMIT_SHA
+  script:
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        # gofmt reports rather than fails, so turn its output into an exit code.
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "gofmt: the following files need formatting:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+        go vet ./...
+
+        # The live tests only compile under this tag, so vet them separately or
+        # they go unchecked until someone runs them by hand.
+        go vet -tags=integration ./...
+
+        # The published artifact is built from the Go version pinned in
+        # jitpack.yml, so a standard library advisory ships with it.
+        #
+        # Accepted findings are subtracted rather than the exit status trusted,
+        # since govulncheck reports one by exiting non-zero. GO-2024-3218 is DHT
+        # censorship by a Sybil adversary: no fix exists and it is inherent to
+        # using a DHT at all.
+        printf "%s\n" GO-2024-3218 | sort -u > /tmp/accepted
+
+        # 0 is a clean scan and 3 is a scan that found something. Anything else
+        # means it never ran, which must not pass for want of output.
+        set +e
+        report=$(govulncheck ./... 2>&1)
+        scan=$?
+        set -e
+
+        if [ "$scan" -ne 0 ] && [ "$scan" -ne 3 ]; then
+          echo "govulncheck did not run (exit $scan):"
+          echo "$report"
+          exit 1
+        fi
+
+        printf "%s\n" "$report" | grep -oE "GO-[0-9]{4}-[0-9]+" | sort -u > /tmp/found || true
+        unexpected=$(comm -23 /tmp/found /tmp/accepted)
+        if [ -n "$unexpected" ]; then
+          echo "govulncheck reported findings that are not on the accepted list:"
+          echo "$unexpected"
+          exit 1
+        fi
+      '
+
+unit:
+  extends: .test:base
+  variables:
+    CONTAINER_TAG: go-unit-$CI_COMMIT_SHA
+  script:
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        go test -v -race -count=1 -timeout 15m -coverprofile=coverage.out ./... 2>&1 \
+          | tee test.log \
+          | go-junit-report -set-exit-code > report.xml
+
+        # internal/testpeer is test-support code. Go only credits a package for
+        # coverage from its own tests, so counting it reports 0% for code that is
+        # exercised constantly and understates the rest.
+        grep -v "ipfs-mobile/internal/" coverage.out > coverage.prod.out
+        go tool cover -func=coverage.prod.out | tail -1
+      '
+  # In after_script, so a failing run still yields its report and log.
+  after_script:
+    - mkdir -p reports
+    - docker cp $CONTAINER_TAG:/app/report.xml reports/report.xml || true
+    - docker cp $CONTAINER_TAG:/app/test.log reports/test.log || true
+    - docker cp $CONTAINER_TAG:/app/coverage.out reports/coverage.out || true
+    - docker rm -f $CONTAINER_TAG || true
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - reports
+    reports:
+      junit: reports/report.xml
+
+# Live tests against the public IPFS network. allow_failure because they depend
+# on third party infrastructure, so a failure is as likely to mean the network
+# had a bad day as that this commit broke something.
+integration:
+  extends: .test:base
+  variables:
+    CONTAINER_TAG: go-integration-$CI_COMMIT_SHA
+  allow_failure: true
+  timeout: 30m
+  script:
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        go test -tags=integration -v -count=1 -timeout 25m ./... 2>&1 \
+          | tee integration.log \
+          | go-junit-report -set-exit-code > integration-report.xml
+      '
+  after_script:
+    - mkdir -p reports
+    - docker cp $CONTAINER_TAG:/app/integration-report.xml reports/integration-report.xml || true
+    - docker cp $CONTAINER_TAG:/app/integration.log reports/integration.log || true
+    - docker rm -f $CONTAINER_TAG || true
+  artifacts:
+    when: always
+    expire_in: 1 week
+    paths:
+      - reports
+    reports:
+      junit: reports/integration-report.xml
+
+### Build ###
+
+# The gomobile bind and the Kotlin wrapper, which is what actually ships. Not
+# optional: the bind links transports the Go tests never exercise, and nothing
+# else here would catch it breaking.
+android:
+  stage: build
+  interruptible: true
+  timeout: 1h
+  variables:
+    CONTAINER_TAG: android-build-$CI_COMMIT_SHA
+  script:
+    - |
+      docker run --name $CONTAINER_TAG $GOOGLE_TAG bash -c '
+        set -eo pipefail
+
+        ./build_ffi android
+        cd android
+        ./gradlew --no-daemon :app:assembleRelease :app:test
+      '
+  after_script:
+    - mkdir -p artifacts
+    - docker cp $CONTAINER_TAG:/app/android/ffi/ipfs.aar artifacts/ipfs.aar || true
+    - docker cp $CONTAINER_TAG:/app/android/ffi/ipfs-sources.jar artifacts/ipfs-sources.jar || true
+    - docker cp $CONTAINER_TAG:/app/android/app/build/outputs/aar artifacts/client || true
+    - docker rm -f $CONTAINER_TAG || true
+  artifacts:
+    name: ipfs-mobile-$CI_COMMIT_SHA
+    when: always
+    expire_in: 1 week
+    paths:
+      - artifacts
+  tags:
+    - docker
