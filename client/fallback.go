@@ -10,13 +10,73 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/ipfs/boxo/bitswap/network/httpnet"
 	"github.com/ipfs/go-cid"
 )
 
 const gatewayScratchPrefix = ".ipfs-gateway-"
+
+// gatewayCooldowns remembers hosts that told the fallback to slow down (HTTP
+// 429, 502, 503, 504). Process-wide on purpose: callers routinely build a
+// Client per download, so per-Client memory would be forgotten exactly when
+// the next download is about to ask the same host again. Deadlines honor
+// Retry-After and are capped at httpnet.DefaultMaxBackoff, the same bound the
+// verified retrieval path uses.
+var gatewayCooldowns = struct {
+	sync.Mutex
+	deadline map[string]time.Time
+}{deadline: make(map[string]time.Time)}
+
+// gatewayCoolingDown reports whether the gateway's host asked for a pause
+// that has not lapsed yet.
+func gatewayCoolingDown(gateway string) (time.Time, bool) {
+	parsed, err := url.Parse(gateway)
+	if err != nil {
+		return time.Time{}, false
+	}
+
+	gatewayCooldowns.Lock()
+	dl, ok := gatewayCooldowns.deadline[parsed.Host]
+	gatewayCooldowns.Unlock()
+
+	if !ok || !time.Now().Before(dl) {
+		return time.Time{}, false
+	}
+	return dl, true
+}
+
+// startGatewayCooldown records how long the host wants to be left alone.
+func startGatewayCooldown(host string, retryAfter string) {
+	wait := retryAfterDelay(retryAfter)
+
+	gatewayCooldowns.Lock()
+	gatewayCooldowns.deadline[host] = time.Now().Add(wait)
+	gatewayCooldowns.Unlock()
+}
+
+// retryAfterDelay turns a Retry-After header into a wait, bounded by
+// httpnet.DefaultMaxBackoff. An absent, malformed, or already-expired value
+// falls back to httpnet.DefaultConnectFailureBackoff rather than to no wait
+// at all, so a host that throttles without a usable deadline still gets a
+// pause.
+func retryAfterDelay(header string) time.Duration {
+	var wait time.Duration
+	if secs, err := strconv.ParseInt(header, 10, 64); err == nil {
+		wait = time.Duration(secs) * time.Second
+	} else if date, err := time.Parse(time.RFC1123, header); err == nil {
+		wait = time.Until(date)
+	}
+
+	if wait <= 0 {
+		return httpnet.DefaultConnectFailureBackoff
+	}
+	return min(wait, httpnet.DefaultMaxBackoff)
+}
 
 // SizeLimitError reports content larger than the caller allowed. A distinct
 // type because no other source will return smaller content, so it ends the
@@ -59,6 +119,13 @@ func (client *Client) fetchFromGateways(ctx context.Context, target cid.Cid, out
 		// cost at most the attempt already in flight.
 		if client.isClosed() {
 			return ErrClosed
+		}
+
+		// A host that asked to slow down gets no request until its deadline
+		// lapses; the next gateway may still serve the content.
+		if dl, cooling := gatewayCoolingDown(gateway); cooling {
+			failures = append(failures, fmt.Sprintf("%s: host in cooldown until %s", gateway, dl))
+			continue
 		}
 
 		attempt, cancel := context.WithTimeout(ctx, client.fallbackStepTimeout)
@@ -121,6 +188,17 @@ func fetchFromGateway(ctx context.Context, gateway string, target cid.Cid, outpu
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
+		// Throttling and overload answers ask for a pause; remember it so
+		// the downloads that follow do not pile onto a struggling host.
+		// Content-level answers (404, 410, 403) cool nothing: the same host
+		// may serve the next CID fine.
+		switch response.StatusCode {
+		case http.StatusTooManyRequests,
+			http.StatusBadGateway,
+			http.StatusServiceUnavailable,
+			http.StatusGatewayTimeout:
+			startGatewayCooldown(request.URL.Host, response.Header.Get("Retry-After"))
+		}
 		return fmt.Errorf("http %d", response.StatusCode)
 	}
 

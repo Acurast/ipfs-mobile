@@ -6,8 +6,12 @@ import (
 	"context"
 	"errors"
 	"ipfs-mobile/internal/testpeer"
+
+	"github.com/ipfs/boxo/bitswap/network/httpnet"
+	"github.com/ipfs/go-cid"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -380,5 +384,119 @@ func TestCloseCancelsAnAttemptInFlight(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(10 * time.Second):
 		t.Error("the gateway handler never saw its request cancelled")
+	}
+}
+
+// A gateway that throttles the fallback is left alone until its Retry-After
+// deadline, instead of being asked again by every following download.
+func TestFallbackHonorsRetryAfter(t *testing.T) {
+	var hits atomic.Int64
+	throttled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Retry-After", "30")
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(throttled.Close)
+
+	client := newClient(t, &Config{
+		Gateways:                       []string{throttled.URL},
+		DisableDHT:                     true,
+		AllowUnverifiedGatewayFallback: true,
+	})
+
+	target := cid.MustParse("bafkqaaa")
+	ctx := context.Background()
+
+	if err := client.fetchFromGateways(ctx, target, filepath.Join(t.TempDir(), "out"), -1); err == nil {
+		t.Fatal("expected the throttled gateway to fail")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("expected one request, got %d", got)
+	}
+
+	// The next download during the cooldown makes no request at all.
+	err := client.fetchFromGateways(ctx, target, filepath.Join(t.TempDir(), "out"), -1)
+	if err == nil || !strings.Contains(err.Error(), "cooldown") {
+		t.Fatalf("expected a cooldown failure, got: %v", err)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("cooldown should suppress requests, got %d", got)
+	}
+
+	// Once the deadline lapses, requests resume.
+	host := mustHost(t, throttled.URL)
+	gatewayCooldowns.Lock()
+	gatewayCooldowns.deadline[host] = time.Now().Add(-time.Second)
+	gatewayCooldowns.Unlock()
+
+	if err := client.fetchFromGateways(ctx, target, filepath.Join(t.TempDir(), "out"), -1); err == nil {
+		t.Fatal("expected the still-throttled gateway to fail")
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("expired cooldown should allow a request, got %d", got)
+	}
+}
+
+func mustHost(t *testing.T, gateway string) string {
+	t.Helper()
+
+	parsed, err := url.Parse(gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed.Host
+}
+
+// Content-level misses must not cool a host: the same gateway may serve the
+// next CID fine.
+func TestFallbackDoesNotCoolContentMisses(t *testing.T) {
+	var hits atomic.Int64
+	missing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(missing.Close)
+
+	client := newClient(t, &Config{
+		Gateways:                       []string{missing.URL},
+		DisableDHT:                     true,
+		AllowUnverifiedGatewayFallback: true,
+	})
+
+	target := cid.MustParse("bafkqaaa")
+	ctx := context.Background()
+
+	for i := range 2 {
+		if err := client.fetchFromGateways(ctx, target, filepath.Join(t.TempDir(), "out"), -1); err == nil {
+			t.Fatalf("fetch %d: expected a failure", i)
+		}
+	}
+	if got := hits.Load(); got != 2 {
+		t.Fatalf("404s must not suppress requests, got %d", got)
+	}
+}
+
+func TestRetryAfterDelay(t *testing.T) {
+	for _, test := range []struct {
+		header string
+		want   time.Duration
+	}{
+		{"", httpnet.DefaultConnectFailureBackoff},
+		{"garbage", httpnet.DefaultConnectFailureBackoff},
+		{"30", 30 * time.Second},
+		{"0", httpnet.DefaultConnectFailureBackoff},
+		{"-5", httpnet.DefaultConnectFailureBackoff},
+		{"3600", httpnet.DefaultMaxBackoff},
+		{time.Now().Add(-time.Hour).UTC().Format(time.RFC1123), httpnet.DefaultConnectFailureBackoff},
+	} {
+		if got := retryAfterDelay(test.header); got != test.want {
+			t.Errorf("retryAfterDelay(%q) = %s, want %s", test.header, got, test.want)
+		}
+	}
+
+	// A future date maps to roughly its distance from now.
+	future := time.Now().Add(30 * time.Second).UTC().Format(time.RFC1123)
+	if got := retryAfterDelay(future); got <= 25*time.Second || got > 31*time.Second {
+		t.Errorf("retryAfterDelay(%q) = %s, want about 30s", future, got)
 	}
 }
