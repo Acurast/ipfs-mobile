@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	madns "github.com/multiformats/go-multiaddr-dns"
 
@@ -14,6 +16,21 @@ import (
 )
 
 const dnsPort = "53"
+
+// How long a TXT answer is reused. The records behind a /dnsaddr/ address name
+// bootstrap peers and change on the order of months, while libp2p looks them up
+// again for every dial - the same few names, over and over.
+const txtAnswerLifetime = time.Hour
+
+// How many answers are held. A peer chooses the names in the records it serves,
+// and those name further records, so the keys here are not all ours to count on.
+const txtAnswerLimit = 64
+
+// txtAnswers remembers what /dnsaddr/ lookups resolved to. Process-wide for the
+// same reason gatewayCooldowns is: a caller that builds a Client per download
+// would otherwise drop the answers exactly when the next download is about to
+// ask for the same bootstrap names again.
+var txtAnswers = newTXTCache()
 
 // newResolver builds the resolver libp2p resolves addresses with. None returns
 // none, leaving libp2p its own.
@@ -79,7 +96,68 @@ type txtOverride struct {
 }
 
 func (resolver txtOverride) LookupTXT(ctx context.Context, name string) ([]string, error) {
-	return resolver.servers.LookupTXT(ctx, name)
+	if records, ok := txtAnswers.lookup(name); ok {
+		return records, nil
+	}
+
+	records, err := resolver.servers.LookupTXT(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+
+	txtAnswers.keep(name, records)
+
+	return records, nil
+}
+
+// txtCache holds answers for txtAnswerLifetime. Every dial any Client makes goes
+// through the one of these, so it is reached from many at once.
+type txtCache struct {
+	mutex   sync.Mutex
+	answers map[string]txtAnswer
+}
+
+type txtAnswer struct {
+	records []string
+	until   time.Time
+}
+
+func newTXTCache() *txtCache {
+	return &txtCache{answers: make(map[string]txtAnswer)}
+}
+
+func (cache *txtCache) lookup(name string) ([]string, bool) {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	answer, held := cache.answers[name]
+	if !held || time.Now().After(answer.until) {
+		return nil, false
+	}
+
+	return answer.records, true
+}
+
+// keep stores an answer, dropping the ones that have lapsed to make room. A full
+// cache of live answers takes no more, since evicting one a peer cannot choose in
+// favour of one it can is the wrong way round.
+func (cache *txtCache) keep(name string, records []string) {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	if len(cache.answers) >= txtAnswerLimit {
+		for cached, answer := range cache.answers {
+			if time.Now().After(answer.until) {
+				delete(cache.answers, cached)
+			}
+		}
+
+		if len(cache.answers) >= txtAnswerLimit {
+			return
+		}
+	}
+
+	cache.answers[name] = txtAnswer{records: records, until: time.Now().Add(txtAnswerLifetime)}
 }
 
 func (resolver txtOverride) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {

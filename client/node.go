@@ -110,7 +110,7 @@ type nodeConfig struct {
 // startNode brings up a host and gives its dials a short head start, bounded by
 // ctx. It fails only when there is provably nowhere to fetch from.
 func startNode(ctx context.Context, config nodeConfig) (*node, error) {
-	host, err := makeHost(config.port, config.resolver)
+	host, err := makeHost(config)
 	if err != nil {
 		return nil, err
 	}
@@ -467,7 +467,7 @@ func (node *node) close() {
 	node.host.Close()
 }
 
-func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, error) {
+func makeHost(config nodeConfig) (host.Host, error) {
 	// Ed25519 because the identity is ephemeral and RSA keygen costs seconds on
 	// mobile ARM cores.
 	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
@@ -486,9 +486,10 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 	}
 
 	opts := []libp2p.Option{
-		listenOn(port),
+		listenOn(config.port),
 		libp2p.Identity(priv),
 		libp2p.ConnectionManager(connections),
+		libp2p.ConnectionGater(newDiscoveredAddrGater(config.peers)),
 
 		// Noise before TLS, reversing go-libp2p's order. Every implementation has
 		// to support Noise and fewer support TLS, so offering it first usually
@@ -506,8 +507,8 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 		libp2p.Transport(websocket.New),
 	}
 
-	if resolver != nil {
-		opts = append(opts, libp2p.MultiaddrResolver(resolver))
+	if config.resolver != nil {
+		opts = append(opts, libp2p.MultiaddrResolver(config.resolver))
 	}
 
 	return libp2p.New(opts...)
