@@ -44,6 +44,13 @@ func (gater discoveredAddrGater) InterceptAddrDial(id peer.ID, addr ma.Multiaddr
 		return true
 	}
 
+	return dialableAddr(addr)
+}
+
+// dialableAddr reports whether an address a stranger advertised is worth a dial,
+// by the rule discoveredAddrGater documents. Shared with the peer snapshot, which
+// must not keep an address the gater would then refuse.
+func dialableAddr(addr ma.Multiaddr) bool {
 	if !manet.IsPrivateAddr(addr) {
 		return true
 	}

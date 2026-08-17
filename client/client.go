@@ -42,6 +42,15 @@ type Config struct {
 	// derived for this and nothing else.
 	IdentitySeed []byte
 
+	// PeerSnapshotPath is a file the client keeps the peers it met in, so the next
+	// node starts by dialling peers already known to hold up rather than walking
+	// the DHT to find them again. The directory must exist and be writable.
+	//
+	// Worth setting wherever nodes come and go - an IdleTimeout short against how
+	// often content is fetched - since filling a routing table is most of what a
+	// start costs. Empty keeps nothing.
+	PeerSnapshotPath string
+
 	// DelegatedRoutingEndpoint resolves providers through a delegated routing v1
 	// endpoint such as "https://cid.contact", alongside the DHT. Empty disables it.
 	//
@@ -134,6 +143,7 @@ func New(config *Config) (*Client, error) {
 		peers:        peers,
 		disableDHT:   config.DisableDHT,
 		identitySeed: config.IdentitySeed,
+		snapshotPath: config.PeerSnapshotPath,
 		gateways:     gateways,
 		gatewayHosts: gatewayHosts,
 		resolver:     resolver,

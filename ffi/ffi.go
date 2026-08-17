@@ -43,6 +43,11 @@ type ClientConfig struct {
 	// It becomes a private key: give it bytes derived for this and nothing else.
 	IdentitySeed string
 
+	// PeerSnapshotPath is a file the client keeps the peers it met in, so the next
+	// node dials peers already known to hold up rather than walking the DHT to find
+	// them again. The directory must exist and be writable. Empty keeps nothing.
+	PeerSnapshotPath string
+
 	// DelegatedRouting is a delegated routing v1 endpoint such as
 	// "https://cid.contact", queried alongside the DHT. It finds content that is
 	// indexed but never announced to the DHT; in exchange the endpoint learns
@@ -123,6 +128,7 @@ func NewClient(config *ClientConfig) (*Client, error) {
 		DNSServers:                     utils.GetStringSlice(config.DNSServers),
 		DisableDHT:                     config.DisableDHT,
 		IdentitySeed:                   seed,
+		PeerSnapshotPath:               config.PeerSnapshotPath,
 		DelegatedRoutingEndpoint:       config.DelegatedRouting,
 		IdleTimeout:                    milliseconds(config.IdleTimeout),
 		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,

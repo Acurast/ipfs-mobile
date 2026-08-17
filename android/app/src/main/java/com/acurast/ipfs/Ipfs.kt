@@ -25,7 +25,15 @@ public fun Ipfs(
     gateways: Ipfs.Gateways = Ipfs.Gateways(),
     timeouts: Ipfs.Timeouts = Ipfs.Timeouts(),
     port: Int = Ipfs.PORT,
-): Ipfs = Ipfs(routing.withDnsServers(context.dnsServers), gateways, timeouts, port)
+): Ipfs = Ipfs(
+    routing.withDnsServers(context.dnsServers),
+    gateways,
+    timeouts,
+    port,
+    // Chosen here rather than asked for: the directory belongs to this library, and
+    // a start that has to rediscover the network is the cost of not keeping one.
+    context.peerSnapshotPath,
+)
 
 /** Bootstrap peers alone. */
 public fun Ipfs(context: Context, bootstrapNodes: List<String>): Ipfs =
@@ -40,6 +48,7 @@ public class Ipfs internal constructor(
     private val gateways: Gateways = Gateways(),
     private val timeouts: Timeouts = Timeouts(),
     private val port: Int = PORT,
+    private val peerSnapshotPath: String = NO_PEER_SNAPSHOT,
 ) : Closeable {
 
     /** How content is located. */
@@ -201,6 +210,7 @@ public class Ipfs internal constructor(
                 it.disableDHT = !routing.dht
                 it.delegatedRouting = routing.delegated ?: NO_DELEGATED_ROUTING
                 it.identitySeed = routing.identitySeed ?: EPHEMERAL_IDENTITY
+                it.peerSnapshotPath = peerSnapshotPath
                 it.gateways = gateways.urls.joinToString(DELIMITER_LIST_STRING)
                 it.allowUnverifiedGatewayFallback = gateways.allowUnverifiedFallback
                 it.idleTimeout = timeouts.idle?.inWholeMilliseconds ?: NO_TIMEOUT
@@ -211,19 +221,6 @@ public class Ipfs internal constructor(
         ).also { client = it }
     }
 
-    private val Context.ipfsDir: File
-        get() = File(dataDir, DIR_IPFS).apply {
-            if (!exists()) mkdir()
-        }
-
-    private fun Context.ipfsDir(child: String): File =
-        File(ipfsDir, child).apply {
-            if (!exists()) mkdirs()
-        }
-
-    private val Context.ipfsDataDir: File
-        get() = ipfsDir(DIR_DATA)
-
     public companion object {
         internal const val PORT = -1
 
@@ -232,12 +229,10 @@ public class Ipfs internal constructor(
         private const val NO_TIMEOUT = -1L
         private const val NO_DELEGATED_ROUTING = ""
         private const val EPHEMERAL_IDENTITY = ""
+        private const val NO_PEER_SNAPSHOT = ""
 
         /** ...and defers to the client's own default on a non-positive duration. */
         private const val USE_DEFAULT = 0L
-
-        private const val DIR_IPFS = "ipfs"
-        private const val DIR_DATA = "data"
 
         private const val DELIMITER_LIST_STRING = ";"
     }

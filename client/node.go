@@ -82,6 +82,12 @@ type node struct {
 	// The dials last started, so a retry does not stack on one still running.
 	peerDials    *dialGroup
 	gatewayDials *dialGroup
+
+	// Where close leaves the peers this node met, for the next one to start from.
+	snapshotPath string
+	// configured peers are not worth writing down, since they arrive in the
+	// configuration; close needs them to tell which those were.
+	configured []peer.AddrInfo
 }
 
 // nodeConfig is everything a node needs to start.
@@ -93,6 +99,10 @@ type nodeConfig struct {
 	// identitySeed fixes the peer id across node lifetimes. Empty leaves it to
 	// last only as long as the node.
 	identitySeed []byte
+
+	// snapshotPath is where the peers this node meets are left for the next one to
+	// start from. Empty keeps nothing, and every start discovers the network again.
+	snapshotPath string
 
 	// gateways are asked at the same time as libp2p peers, not after them.
 	gateways []peer.AddrInfo
@@ -121,17 +131,32 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	// The node outlives any single request, so its lifetime is not tied to ctx.
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
-	node := &node{cancel: cancel, lifetime: nodeCtx, host: host}
+	node := &node{
+		cancel:       cancel,
+		lifetime:     nodeCtx,
+		host:         host,
+		snapshotPath: config.snapshotPath,
+		configured:   config.peers,
+	}
 
 	var kadFinder routing.ContentDiscovery
 
 	if !config.disableDHT {
+		// Peers a previous node left behind, so the table fills by dialling peers
+		// already known to speak the protocol rather than by walking out to find
+		// them. They seed the bootstrap only: unlike the configured peers they are
+		// not dialled up front and not protected from trimming, since none of them
+		// is a route the operator chose.
+		seeds := make([]peer.AddrInfo, 0, len(config.peers)+snapshotPeers)
+		seeds = append(seeds, config.peers...)
+		seeds = append(seeds, readPeerSnapshot(config.snapshotPath)...)
+
 		// Client mode: a phone behind NAT on a metered connection makes a poor DHT
 		// server, so query without answering.
 		kad, err := dht.New(
 			host,
 			dht.Mode(dht.ModeClient),
-			dht.BootstrapPeers(config.peers...),
+			dht.BootstrapPeers(seeds...),
 			dht.Concurrency(dhtQueryConcurrency),
 		)
 		if err != nil {
@@ -450,6 +475,13 @@ func validEntryName(name string) bool {
 
 // close tolerates a partially built node, which is how startNode unwinds.
 func (node *node) close() {
+	// Before anything is torn down, since the routing table is what is being read
+	// and the DHT is about to be closed. A failure here costs the next start its
+	// head start and nothing else, so it is logged rather than returned.
+	if err := writePeerSnapshot(node.snapshotPath, snapshotWorth(node, node.configured)); err != nil {
+		fmt.Printf("failed to record the peers this node met: %s\n", err)
+	}
+
 	node.cancel()
 
 	if node.bs != nil {
