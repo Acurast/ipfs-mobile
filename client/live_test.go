@@ -64,8 +64,7 @@ func treeDigest(t *testing.T, root string) (int64, string) {
 	return total, hex.EncodeToString(hash.Sum(nil))
 }
 
-// Mirrors Constants.IPFS_BOOTSTRAP_NODES in acurast-data-transmitter, minus
-// Pinata. These hold no content themselves, so retrieving through them exercises
+// These hold no content themselves, so retrieving through them exercises
 // content routing end to end.
 var defaultLivePeers = []string{
 	"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -321,13 +320,9 @@ func TestLiveDHTAloneCannotFindIndexedOnlyContent(t *testing.T) {
 	t.Logf("dht alone: %v (%d peers connected)", err, connectedPeers(client))
 }
 
-// Mirrors Constants.IPFS_GATEWAYS in acurast-data-transmitter.
-var defaultLiveGateways = []string{
-	"https://ipfs.io",
-	"https://dweb.link",
-	"https://gateway.pinata.cloud",
-	"https://ipfs.filebase.io",
-}
+// TODO: set this up with test gateways we run ourselves. Empty until then, with
+// the tests that consume it skipped, so no pipeline probes third party gateways.
+var defaultLiveGateways = []string{}
 
 // Surveys which configured gateways actually serve verified blocks, rather than
 // asserting it: the answer is a property of someone else's infrastructure, and
@@ -337,6 +332,8 @@ var defaultLiveGateways = []string{
 // httpnet does not follow, and at least one sends HTTP/2 headers larger than Go
 // accepts. Hence the unverified fallback.
 func TestLiveGatewayVerifiedBlockSupport(t *testing.T) {
+	t.Skip("TODO: re-enable once defaultLiveGateways names test gateways")
+
 	var supported []string
 
 	for _, gateway := range defaultLiveGateways {
@@ -373,6 +370,8 @@ func TestLiveGatewayVerifiedBlockSupport(t *testing.T) {
 
 // The configuration a processor would actually run.
 func TestLiveAllRoutesTogether(t *testing.T) {
+	t.Skip("TODO: re-enable once defaultLiveGateways names test gateways")
+
 	client, err := New(&Config{
 		BootstrapPeers:                 livePeers(),
 		DelegatedRoutingEndpoint:       "https://cid.contact",
