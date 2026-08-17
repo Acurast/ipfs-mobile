@@ -62,6 +62,17 @@ public class Ipfs internal constructor(
         val delegated: String? = null,
 
         /**
+         * Hex for the 32 bytes that name this node's peer identity. The same seed
+         * gives the same peer id on every start, so a node coming back from an
+         * idle shutdown is one its peers have already met rather than a stranger.
+         * `null` generates an identity lasting only as long as the node.
+         *
+         * It becomes a private key: pass bytes derived for this and nothing else,
+         * never a key that signs anything.
+         */
+        val identitySeed: String? = null,
+
+        /**
          * Resolvers used to look up addresses, for example `1.1.1.1`. Port 53
          * unless one is given.
          *
@@ -189,6 +200,7 @@ public class Ipfs internal constructor(
                 it.dnsServers = routing.dnsServers.joinToString(DELIMITER_LIST_STRING)
                 it.disableDHT = !routing.dht
                 it.delegatedRouting = routing.delegated ?: NO_DELEGATED_ROUTING
+                it.identitySeed = routing.identitySeed ?: EPHEMERAL_IDENTITY
                 it.gateways = gateways.urls.joinToString(DELIMITER_LIST_STRING)
                 it.allowUnverifiedGatewayFallback = gateways.allowUnverifiedFallback
                 it.idleTimeout = timeouts.idle?.inWholeMilliseconds ?: NO_TIMEOUT
@@ -219,6 +231,7 @@ public class Ipfs internal constructor(
         private const val NO_SIZE_LIMIT = -1L
         private const val NO_TIMEOUT = -1L
         private const val NO_DELEGATED_ROUTING = ""
+        private const val EPHEMERAL_IDENTITY = ""
 
         /** ...and defers to the client's own default on a non-positive duration. */
         private const val USE_DEFAULT = 0L

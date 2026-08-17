@@ -84,6 +84,44 @@ func TestNewClientRejectsUnusablePeerLists(t *testing.T) {
 	}
 }
 
+// Hex is how gomobile carries the identity seed across the FFI boundary, since it
+// cannot bind a []byte.
+func TestNewClientReadsAHexIdentitySeed(t *testing.T) {
+	const usable = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+
+	for _, test := range []struct {
+		name string
+		seed string
+		want bool
+	}{
+		{"empty leaves the identity ephemeral", "", true},
+		{"thirty two bytes of hex", usable, true},
+		{"upper case hex", strings.ToUpper(usable), true},
+		{"not hex", "nothex" + usable[6:], false},
+		{"odd number of digits", usable[1:], false},
+		{"too few bytes", "0102", false},
+		{"too many bytes", usable + "21", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := NewClient(&ClientConfig{
+				Gateways:     "https://gateway.example.net",
+				IdentitySeed: test.seed,
+			})
+			if err != nil {
+				if test.want {
+					t.Fatalf("a usable seed was refused: %v", err)
+				}
+				return
+			}
+			client.Close()
+
+			if !test.want {
+				t.Fatal("an unusable seed was accepted")
+			}
+		})
+	}
+}
+
 // The ";" separated list is how gomobile carries a peer list across the FFI
 // boundary, since it cannot bind a []string.
 func TestNewClientParsesDelimitedPeerList(t *testing.T) {

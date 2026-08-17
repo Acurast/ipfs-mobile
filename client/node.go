@@ -15,7 +15,6 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -90,6 +89,10 @@ type nodeConfig struct {
 	port       int32
 	peers      []peer.AddrInfo
 	disableDHT bool
+
+	// identitySeed fixes the peer id across node lifetimes. Empty leaves it to
+	// last only as long as the node.
+	identitySeed []byte
 
 	// gateways are asked at the same time as libp2p peers, not after them.
 	gateways []peer.AddrInfo
@@ -468,9 +471,7 @@ func (node *node) close() {
 }
 
 func makeHost(config nodeConfig) (host.Host, error) {
-	// Ed25519 because the identity is ephemeral and RSA keygen costs seconds on
-	// mobile ARM cores.
-	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+	priv, err := nodeIdentity(config.identitySeed)
 	if err != nil {
 		return nil, err
 	}
