@@ -48,8 +48,8 @@ func parseGateways(gateways []string) (peers []peer.AddrInfo, hosts []string, ur
 	return peers, hosts, urls
 }
 
-// gatewayMultiaddr renders a gateway URL as the exchange expects it, for
-// example https://ipfs.io -> /dns4/ipfs.io/tcp/443/https.
+// gatewayMultiaddr renders a gateway URL as the exchange expects it, for example
+// https://gateway.example.net -> /dns4/gateway.example.net/tcp/443/https.
 func gatewayMultiaddr(gateway string) (multiaddr.Multiaddr, error) {
 	parsed, err := url.Parse(gateway)
 	if err != nil {

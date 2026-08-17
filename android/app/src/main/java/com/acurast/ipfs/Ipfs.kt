@@ -76,8 +76,8 @@ public class Ipfs internal constructor(
     /** HTTP gateways, and how far to trust them. */
     public data class Gateways(
         /**
-         * Gateway URLs, for example `https://ipfs.io`, fetched from alongside
-         * libp2p peers and verified like any other source.
+         * Gateway URLs, for example `https://gateway.example.net`, fetched from
+         * alongside libp2p peers and verified like any other source.
          */
         val urls: List<String> = emptyList(),
 

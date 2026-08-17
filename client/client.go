@@ -49,8 +49,9 @@ type Config struct {
 	// they are otherwise unresolvable. Empty uses whatever the platform offers.
 	DNSServers []string
 
-	// Gateways are HTTP gateway URLs, for example "https://ipfs.io", fetched from
-	// alongside libp2p peers. What they return is verified like any other block.
+	// Gateways are HTTP gateway URLs, for example "https://gateway.example.net",
+	// fetched from alongside libp2p peers. What they return is verified like any
+	// other block.
 	Gateways []string
 
 	// PrimaryTimeout is the most the primary phase - peers and gateways, every
