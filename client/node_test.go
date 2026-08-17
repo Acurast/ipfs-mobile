@@ -96,7 +96,7 @@ func TestParsePeersMergesAddressesForOneID(t *testing.T) {
 func TestDialAllSettlesWithNothingConnectedWhenNoneAnswer(t *testing.T) {
 	peers := parsePeers([]string{deadPeer})
 
-	host, err := makeHost(0, nil)
+	host, err := makeHost(nodeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestDialAllSignalsTheFirstReachablePeer(t *testing.T) {
 
 	peers := parsePeers([]string{deadPeer, addr})
 
-	host, err := makeHost(0, nil)
+	host, err := makeHost(nodeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ const stalledPeerGivesUpAfter = 5 * time.Second
 func TestStalledPeerGivesUpWhenExpected(t *testing.T) {
 	peers := parsePeers([]string{testpeer.Stalled(t)})
 
-	host, err := makeHost(0, nil)
+	host, err := makeHost(nodeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,7 +437,7 @@ func TestARepeatedConnectFailureIsReportedOnce(t *testing.T) {
 		return true
 	})
 
-	host, err := makeHost(0, nil)
+	host, err := makeHost(nodeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -501,7 +501,7 @@ func captureStdout(t *testing.T) (*bytes.Buffer, func()) {
 // Nothing dials this node, and a listener costs a standing interface lookup that
 // Android refuses. A port asked for explicitly is still honoured.
 func TestNoListenerUnlessAPortIsAskedFor(t *testing.T) {
-	quiet, err := makeHost(0, nil)
+	quiet, err := makeHost(nodeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestNoListenerUnlessAPortIsAskedFor(t *testing.T) {
 		t.Errorf("a node with no port configured advertises %v", addrs)
 	}
 
-	listening, err := makeHost(0, nil)
+	listening, err := makeHost(nodeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +523,7 @@ func TestNoListenerUnlessAPortIsAskedFor(t *testing.T) {
 }
 
 func TestAConfiguredPortIsStillHonoured(t *testing.T) {
-	host, err := makeHost(45991, nil)
+	host, err := makeHost(nodeConfig{port: 45991})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +539,7 @@ func TestAConfiguredPortIsStillHonoured(t *testing.T) {
 // Only the transports the configured peers speak. The libp2p defaults add two
 // more, one of which carries a media stack this never uses.
 func TestOnlyTheTransportsInUseAreStarted(t *testing.T) {
-	host, err := makeHost(0, nil)
+	host, err := makeHost(nodeConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}

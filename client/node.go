@@ -15,7 +15,6 @@ import (
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
-	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -83,6 +82,10 @@ type node struct {
 	// The dials last started, so a retry does not stack on one still running.
 	peerDials    *dialGroup
 	gatewayDials *dialGroup
+
+	// What close needs to record the peers this node met.
+	snapshotPath string
+	configured   []peer.AddrInfo
 }
 
 // nodeConfig is everything a node needs to start.
@@ -90,6 +93,14 @@ type nodeConfig struct {
 	port       int32
 	peers      []peer.AddrInfo
 	disableDHT bool
+
+	// identitySeed names the peer id. Empty leaves it to last only as long as the
+	// node.
+	identitySeed []byte
+
+	// snapshotPath is where the peers met are left for the next node. Empty keeps
+	// nothing.
+	snapshotPath string
 
 	// gateways are asked at the same time as libp2p peers, not after them.
 	gateways []peer.AddrInfo
@@ -110,7 +121,7 @@ type nodeConfig struct {
 // startNode brings up a host and gives its dials a short head start, bounded by
 // ctx. It fails only when there is provably nowhere to fetch from.
 func startNode(ctx context.Context, config nodeConfig) (*node, error) {
-	host, err := makeHost(config.port, config.resolver)
+	host, err := makeHost(config)
 	if err != nil {
 		return nil, err
 	}
@@ -118,17 +129,31 @@ func startNode(ctx context.Context, config nodeConfig) (*node, error) {
 	// The node outlives any single request, so its lifetime is not tied to ctx.
 	nodeCtx, cancel := context.WithCancel(context.Background())
 
-	node := &node{cancel: cancel, lifetime: nodeCtx, host: host}
+	node := &node{
+		cancel:       cancel,
+		lifetime:     nodeCtx,
+		host:         host,
+		snapshotPath: config.snapshotPath,
+		configured:   config.peers,
+	}
 
 	var kadFinder routing.ContentDiscovery
 
 	if !config.disableDHT {
+		// Peers a previous node left behind, so the table fills by dialling peers
+		// already known to speak the protocol rather than by walking out to find
+		// them. Seeds only: none of them is a route the operator chose, so they get
+		// neither a dial of their own nor protection from trimming.
+		seeds := make([]peer.AddrInfo, 0, len(config.peers)+snapshotPeers)
+		seeds = append(seeds, config.peers...)
+		seeds = append(seeds, readPeerSnapshot(config.snapshotPath)...)
+
 		// Client mode: a phone behind NAT on a metered connection makes a poor DHT
 		// server, so query without answering.
 		kad, err := dht.New(
 			host,
 			dht.Mode(dht.ModeClient),
-			dht.BootstrapPeers(config.peers...),
+			dht.BootstrapPeers(seeds...),
 			dht.Concurrency(dhtQueryConcurrency),
 		)
 		if err != nil {
@@ -447,6 +472,13 @@ func validEntryName(name string) bool {
 
 // close tolerates a partially built node, which is how startNode unwinds.
 func (node *node) close() {
+	// Before the teardown below, which takes the routing table this reads with it.
+	// A failure costs the next start its head start and nothing else, so it is
+	// logged rather than returned.
+	if err := writePeerSnapshot(node.snapshotPath, snapshotWorth(node, node.configured)); err != nil {
+		fmt.Printf("failed to record the peers this node met: %s\n", err)
+	}
+
 	node.cancel()
 
 	if node.bs != nil {
@@ -467,10 +499,8 @@ func (node *node) close() {
 	node.host.Close()
 }
 
-func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, error) {
-	// Ed25519 because the identity is ephemeral and RSA keygen costs seconds on
-	// mobile ARM cores.
-	priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+func makeHost(config nodeConfig) (host.Host, error) {
+	priv, err := nodeIdentity(config.identitySeed)
 	if err != nil {
 		return nil, err
 	}
@@ -486,9 +516,10 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 	}
 
 	opts := []libp2p.Option{
-		listenOn(port),
+		listenOn(config.port),
 		libp2p.Identity(priv),
 		libp2p.ConnectionManager(connections),
+		libp2p.ConnectionGater(newDiscoveredAddrGater(config.peers)),
 
 		// Noise before TLS, reversing go-libp2p's order. Every implementation has
 		// to support Noise and fewer support TLS, so offering it first usually
@@ -506,8 +537,8 @@ func makeHost(port int32, resolver libp2pnet.MultiaddrDNSResolver) (host.Host, e
 		libp2p.Transport(websocket.New),
 	}
 
-	if resolver != nil {
-		opts = append(opts, libp2p.MultiaddrResolver(resolver))
+	if config.resolver != nil {
+		opts = append(opts, libp2p.MultiaddrResolver(config.resolver))
 	}
 
 	return libp2p.New(opts...)
