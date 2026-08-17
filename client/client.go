@@ -32,6 +32,24 @@ type Config struct {
 	// peers and whatever DelegatedRoutingEndpoint finds.
 	DisableDHT bool
 
+	// IdentitySeed makes the node's peer id reproducible: the same SeedSize bytes
+	// name the same peer on every start, so a node returning from an idle shutdown
+	// is one its peers have already met. Empty generates an identity that lasts
+	// only as long as the node, and a wrong length is an error rather than a peer
+	// id nobody asked for.
+	//
+	// It becomes an Ed25519 private key, so it is key material: give it bytes
+	// derived for this and nothing else.
+	IdentitySeed []byte
+
+	// PeerSnapshotPath is a file the client keeps the peers it met in, so the next
+	// node starts by dialling peers already known to hold up rather than walking
+	// the DHT to find them again. The directory must exist and be writable.
+	//
+	// Worth setting wherever nodes come and go, an IdleTimeout short against how
+	// often content is fetched being the usual reason. Empty keeps nothing.
+	PeerSnapshotPath string
+
 	// DelegatedRoutingEndpoint resolves providers through a delegated routing v1
 	// endpoint such as "https://cid.contact", alongside the DHT. Empty disables it.
 	//
@@ -49,8 +67,9 @@ type Config struct {
 	// they are otherwise unresolvable. Empty uses whatever the platform offers.
 	DNSServers []string
 
-	// Gateways are HTTP gateway URLs, for example "https://ipfs.io", fetched from
-	// alongside libp2p peers. What they return is verified like any other block.
+	// Gateways are HTTP gateway URLs, for example "https://gateway.example.net",
+	// fetched from alongside libp2p peers. What they return is verified like any
+	// other block.
 	Gateways []string
 
 	// PrimaryTimeout is the most the primary phase - peers and gateways, every
@@ -110,6 +129,10 @@ func New(config *Config) (*Client, error) {
 
 	gateways, gatewayHosts, gatewayURLs := parseGateways(config.Gateways)
 
+	if err := checkIdentitySeed(config.IdentitySeed); err != nil {
+		return nil, err
+	}
+
 	resolver, err := newResolver(config.DNSServers)
 	if err != nil {
 		return nil, err
@@ -119,6 +142,8 @@ func New(config *Config) (*Client, error) {
 		port:         config.Port,
 		peers:        peers,
 		disableDHT:   config.DisableDHT,
+		identitySeed: config.IdentitySeed,
+		snapshotPath: config.PeerSnapshotPath,
 		gateways:     gateways,
 		gatewayHosts: gatewayHosts,
 		resolver:     resolver,
