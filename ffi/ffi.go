@@ -2,6 +2,8 @@ package ffi
 
 import (
 	"context"
+	"encoding/hex"
+	"fmt"
 	"math"
 	"time"
 
@@ -32,6 +34,19 @@ type ClientConfig struct {
 	// DisableDHT turns off DHT provider lookups, leaving only directly connected
 	// peers and whatever DelegatedRouting finds.
 	DisableDHT bool
+
+	// IdentitySeed makes the node's peer id reproducible, so a node returning from
+	// an idle shutdown is one its peers have already met. Hex, for the 32 bytes an
+	// Ed25519 seed takes, since gomobile cannot carry a byte slice. Empty generates
+	// an identity that lasts only as long as the node.
+	//
+	// It becomes a private key: give it bytes derived for this and nothing else.
+	IdentitySeed string
+
+	// PeerSnapshotPath is a file the client keeps the peers it met in, so the next
+	// node dials peers already known to hold up rather than walking the DHT to find
+	// them again. The directory must exist and be writable. Empty keeps nothing.
+	PeerSnapshotPath string
 
 	// DelegatedRouting is a delegated routing v1 endpoint such as
 	// "https://cid.contact", queried alongside the DHT. It finds content that is
@@ -101,12 +116,19 @@ type Client struct {
 
 // NewClient builds a Client. Close must be called when it is no longer needed.
 func NewClient(config *ClientConfig) (*Client, error) {
+	seed, err := identitySeed(config.IdentitySeed)
+	if err != nil {
+		return nil, err
+	}
+
 	inner, err := client.New(&client.Config{
 		BootstrapPeers:                 utils.GetStringSlice(config.BootstrapPeers),
 		Port:                           config.Port,
 		Gateways:                       utils.GetStringSlice(config.Gateways),
 		DNSServers:                     utils.GetStringSlice(config.DNSServers),
 		DisableDHT:                     config.DisableDHT,
+		IdentitySeed:                   seed,
+		PeerSnapshotPath:               config.PeerSnapshotPath,
 		DelegatedRoutingEndpoint:       config.DelegatedRouting,
 		IdleTimeout:                    milliseconds(config.IdleTimeout),
 		AllowUnverifiedGatewayFallback: config.AllowUnverifiedGatewayFallback,
@@ -118,6 +140,21 @@ func NewClient(config *ClientConfig) (*Client, error) {
 	}
 
 	return &Client{inner: inner}, nil
+}
+
+// identitySeed decodes what ClientConfig carries as hex. The length is left to
+// client.Config to hold, so one message describes a wrong seed however it arrived.
+func identitySeed(hexSeed string) ([]byte, error) {
+	if hexSeed == "" {
+		return nil, nil
+	}
+
+	seed, err := hex.DecodeString(hexSeed)
+	if err != nil {
+		return nil, fmt.Errorf("identity seed is not hex: %w", err)
+	}
+
+	return seed, nil
 }
 
 // Get downloads cid to output. A sizeLimit above zero rejects larger content; a

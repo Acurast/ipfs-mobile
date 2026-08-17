@@ -245,7 +245,7 @@ func TestLiveBootstrapPeersAreReachable(t *testing.T) {
 		t.Fatalf("none of the %d configured peers parsed", len(livePeers()))
 	}
 
-	host, err := makeHost(0, nil)
+	host, err := makeHost(nodeConfig{peers: peers})
 	if err != nil {
 		t.Fatal(err)
 	}
